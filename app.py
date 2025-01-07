@@ -1,8 +1,12 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+
+app = Flask(__name__)
+CORS(app)
 
 # Configure the Gemini API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
