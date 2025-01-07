@@ -2,3 +2,4 @@ Flask
 google-generativeai
 youtube-transcript-api
 python-dotenv
+gunicorn
