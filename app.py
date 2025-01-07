@@ -27,7 +27,9 @@ def generate_tutorial(transcript):
 
 def transcribe_youtube_video(video_id):
     # Fetch the transcript for the given video ID
-    transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+    transcript_data = YouTubeTranscriptApi.get_transcript(video_id, proxies={
+        'http': "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001",
+        'https': "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"})
     
     # Combine the transcript entries into a single string
     transcript = " ".join(entry['text'] for entry in transcript_data)
