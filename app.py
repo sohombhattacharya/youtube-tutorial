@@ -5,7 +5,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 import re
 
 # Configure the Gemini API key
-genai.configure(api_key="AIzaSyBqKA38rFZvR8I2LqGrvYuZFMkLhvyPTKk")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 app = Flask(__name__)
 
