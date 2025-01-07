@@ -11,8 +11,6 @@ CORS(app)
 # Configure the Gemini API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-app = Flask(__name__)
-
 def generate_tutorial(transcript):
     # Create a detailed prompt for the Gemini model
     prompt = (
