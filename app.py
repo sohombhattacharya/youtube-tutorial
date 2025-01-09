@@ -49,7 +49,7 @@ def generate_tutorial(transcript, youtube_url):
     
     # Log the title of the tutorial only if there is a response
     if response:
-        title = response.text[:50]  # Extract the first 50 characters
+        title = response.text[:75]  
         logging.info(f"{youtube_url}, {title}")  # Log the title
         return response.text
     else:
