@@ -36,7 +36,7 @@ def generate_tutorial(transcript_data, youtube_url):
         "   - Each section should also point out the start time of the section in the transcript. Include the start time in the section heading end as an integer in a specific format. For example: '[sec:100]'\n\n"        
         "3. **Detailed Explanations**:\n"
         "   - Provide in-depth explanations for each point made in the transcript.\n"
-        "   - Always use bullet points or numbered lists to separate the points. \n\n"
+        "   - ALWAYS use bullet points or numbered lists to represent and separate the points. \n\n"
         "   - At the end of each point, include the start time of the point in the transcript as an integer in a specific format. For example: '[sec:100]'. NEVER include a time range. NEVER include multiple times.\n\n"        
         "4. **Conclusion**:\n"
         "   - Summarize the key takeaways from the transcript.\n"
