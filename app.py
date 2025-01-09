@@ -4,6 +4,7 @@ import os
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+import logging
 
 app = Flask(__name__)
 CORS(app)
@@ -11,7 +12,10 @@ CORS(app)
 # Configure the Gemini API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-def generate_tutorial(transcript):
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+def generate_tutorial(transcript, youtube_url):
     # Create a detailed prompt for the Gemini model
     prompt = (
         "# Tutorial Generation from YouTube Transcript\n\n"
@@ -43,10 +47,15 @@ def generate_tutorial(transcript):
     model = genai.GenerativeModel("gemini-1.5-flash")
     response = model.generate_content(prompt)
     
-    # Extract the tutorial from the response
-    return response.text if response else 'No tutorial generated.'
+    # Log the title of the tutorial only if there is a response
+    if response:
+        title = response.text[:50]  # Extract the first 50 characters
+        logging.info(f"{youtube_url}, {title}")  # Log the title
+        return response.text
+    else:
+        return 'No tutorial generated.'
 
-def transcribe_youtube_video(video_id):
+def transcribe_youtube_video(video_id, youtube_url):
     # Fetch the transcript for the given video ID
     transcript_data = YouTubeTranscriptApi.get_transcript(video_id, proxies={
         'http': "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001",
@@ -56,7 +65,7 @@ def transcribe_youtube_video(video_id):
     transcript = " ".join(entry['text'] for entry in transcript_data)
     
     # Generate a readable tutorial from the transcript
-    tutorial = generate_tutorial(transcript)
+    tutorial = generate_tutorial(transcript, youtube_url)
     
     return tutorial
 
@@ -64,6 +73,9 @@ def transcribe_youtube_video(video_id):
 def generate_tutorial_endpoint():
     data = request.json
     video_url = data.get('url')
+    
+    # Log the video URL
+    logging.info(f"Received YouTube video URL: {video_url}")
     
     # Extract video ID from the URL
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
@@ -74,7 +86,7 @@ def generate_tutorial_endpoint():
     
     try:
         # Generate the tutorial
-        tutorial = transcribe_youtube_video(video_id)
+        tutorial = transcribe_youtube_video(video_id, video_url)
         
         # Return the markdown as plain text
         return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
