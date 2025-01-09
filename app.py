@@ -37,7 +37,7 @@ def generate_tutorial(transcript_data, youtube_url):
         "3. **Detailed Explanations**:\n"
         "   - Provide in-depth explanations for each point made in the transcript.\n"
         "   - Always use bullet points or numbered lists to separate the points. \n\n"
-        "   - At the end of each point, include the start time of the point in the transcript as an integer in a specific format. For example: '[sec:100]'.\n\n"        
+        "   - At the end of each point, include the start time of the point in the transcript as an integer in a specific format. For example: '[sec:100]'. NEVER include a time range. NEVER include multiple times.\n\n"        
         "4. **Conclusion**:\n"
         "   - Summarize the key takeaways from the transcript.\n"
         "   - Encourage readers to explore further or apply what they have learned.\n\n"        
@@ -56,7 +56,6 @@ def generate_tutorial(transcript_data, youtube_url):
     
     # Log the title of the tutorial only if there is a response
     if response:
-        logging.info(response.text)
         title = response.text[:75]  
         logging.info(f"{youtube_url}, {title}")  # Log the title
 
@@ -89,7 +88,6 @@ def generate_tutorial(transcript_data, youtube_url):
 def transcribe_youtube_video(video_id, youtube_url):
     # Determine if running locally using the environment variable
     is_local = os.getenv('APP_ENV') == 'development'
-    logging.info(is_local)
 
     # Set proxies only if not running locally
     proxies = None if is_local else {
@@ -114,10 +112,7 @@ def transcribe_youtube_video(video_id, youtube_url):
 def generate_tutorial_endpoint():
     data = request.json
     video_url = data.get('url')
-    
-    # Log the video URL
-    logging.info(f"Received YouTube video URL: {video_url}")
-    
+        
     # Extract video ID from the URL
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
     if not video_id_match:
