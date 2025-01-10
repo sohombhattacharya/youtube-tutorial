@@ -44,6 +44,7 @@ def generate_tutorial(transcript_data, youtube_url):
         "5. **Engagement**:\n"
         "   - Use a conversational tone to engage the reader.\n"
         "   - Pose questions or prompts that encourage readers to think critically about the content.\n\n"
+        "Additional note: If the section heading is the title of the markdown write up then do not include a start time in the section heading. For example, don't do something like this: # Amazing AI Tools That Will Blow Your Mind [sec:0]. Instead do this: # Amazing AI Tools That Will Blow Your Mind.\n\n"        
         "## Transcript\n"
         f"{transcript_data}\n\n"
         "## Output Format\n"
