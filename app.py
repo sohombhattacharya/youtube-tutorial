@@ -75,12 +75,18 @@ def generate_tutorial(transcript_data, youtube_url):
                 seconds = int(match.group(1))  # Get the seconds value and convert to int
                 
                 # Format the display of seconds
-                if seconds < 60:
-                    display_time = f"{seconds}s"
-                else:
+                # Format the display of seconds
+                if seconds >= 3600:  # Check if seconds is greater than or equal to an hour
+                    hours = seconds // 3600
+                    minutes = (seconds % 3600) // 60
+                    remaining_seconds = seconds % 60
+                    display_time = f"{hours}hr{minutes}m{remaining_seconds}s"
+                elif seconds >= 60:  # Check if seconds is greater than or equal to 60
                     minutes = seconds // 60
                     remaining_seconds = seconds % 60
                     display_time = f"{minutes}m{remaining_seconds}s"
+                else:
+                    display_time = f"{seconds}s"
                 
                 return f'[{display_time}](https://youtu.be/{video_id}?t={seconds})'  
             
