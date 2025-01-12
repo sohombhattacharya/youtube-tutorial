@@ -201,6 +201,9 @@ def convert_html_to_pdf():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     
+    if os.path.exists(pdf_path):
+        os.remove(pdf_path)  # Remove the temporary PDF file
+    
     # Return the S3 URL of the uploaded PDF
     s3_url = f"https://{bucket_name}.s3.amazonaws.com/{s3_key}"
     return jsonify({'pdf_url': s3_url}), 200
