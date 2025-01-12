@@ -115,19 +115,6 @@ def transcribe_youtube_video(video_id, youtube_url):
 
 @app.route('/generate_tutorial', methods=['POST'])
 def generate_tutorial_endpoint():
-
-    # Check for the Authorization header
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith('Bearer '):
-        return jsonify({'error': 'Authorization token is required'}), 401
-    
-    # Extract the token
-    token = auth_header.split(' ')[1]
-    
-    # Validate the token
-    if not validate_token(token):
-        return jsonify({'error': 'Invalid API key'}), 403
-
     data = request.json
     video_url = data.get('url')
         
@@ -149,17 +136,6 @@ def generate_tutorial_endpoint():
 
 @app.route('/convert_html_to_pdf', methods=['POST'])
 def convert_html_to_pdf():
-    # Check for the Authorization header
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith('Bearer '):
-        return jsonify({'error': 'Authorization token is required'}), 401
-    
-    # Extract the token
-    token = auth_header.split(' ')[1]
-    
-    # Validate the token
-    if not validate_token(token):
-        return jsonify({'error': 'Invalid API key'}), 403
     
     data = request.json
     html_content = data.get('html')
