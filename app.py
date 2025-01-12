@@ -8,6 +8,10 @@ import logging
 from dotenv import load_dotenv
 import tempfile
 from xhtml2pdf import pisa
+import boto3
+from botocore.exceptions import NoCredentialsError
+import time  # Import time for generating unique filenames
+import uuid
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
@@ -142,7 +146,6 @@ def generate_tutorial_endpoint():
 
 @app.route('/convert_html_to_pdf', methods=['POST'])
 def convert_html_to_pdf():
-    
     data = request.json
     html_content = data.get('html')
     youtube_url = data.get('url')  # Get the YouTube URL from the request
@@ -157,18 +160,50 @@ def convert_html_to_pdf():
                    html_content
     
     # Create a temporary file to store the PDF
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
-        pdf_path = temp_pdf.name
-        
-        # Convert HTML to PDF using xhtml2pdf
-        with open(pdf_path, 'w+b') as pdf_file:
-            pisa_status = pisa.CreatePDF(html_content, dest=pdf_file)
-        
-        if pisa_status.err:
-            return jsonify({'error': 'Failed to create PDF'}), 500
+    pdf_path = '/tmp/generated_pdf.pdf'  # Use a temporary path for the PDF
     
-    # Return the PDF file
-    return send_file(pdf_path, as_attachment=True)
+    # Convert HTML to PDF using xhtml2pdf
+    with open(pdf_path, 'w+b') as pdf_file:
+        pisa_status = pisa.CreatePDF(html_content, dest=pdf_file)
+    
+    if pisa_status.err:
+        return jsonify({'error': 'Failed to create PDF'}), 500
+    
+    # Upload the PDF to S3
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")  # Get the access key from environment variable
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")  # Get the secret key from environment variable
+    bucket_name = os.getenv("S3_BUCKET_NAME")  # Get the bucket name from environment variable
+    id = uuid.uuid4()
+    s3_key = f"pdfs/{uuid.uuid4()}.pdf"  # Unique key for the PDF in S3
+
+    # Before the upload
+    logging.info(f"Bucket Name: {bucket_name}")
+    logging.info(f"S3 Key: {s3_key}")
+    logging.info(f"Access Key: {access_key}")
+    logging.info(f"Secret Key: {secret_key}")
+
+    # Create an S3 client with access key and secret key
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    )
+
+    try:
+        s3_client.upload_file(
+            pdf_path,
+            bucket_name,
+            s3_key,
+            ExtraArgs={'ContentType': 'application/pdf'}
+        )
+    except NoCredentialsError:
+        return jsonify({'error': 'Credentials not available'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+    # Return the S3 URL of the uploaded PDF
+    s3_url = f"https://{bucket_name}.s3.amazonaws.com/{s3_key}"
+    return jsonify({'pdf_url': s3_url}), 200
 
 if __name__ == "__main__":
     app.run(debug=True)
