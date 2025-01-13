@@ -201,5 +201,39 @@ def convert_html_to_pdf():
     
     return response
 
+@app.route('/get_tutorial', methods=['POST'])
+def get_tutorial():
+    data = request.json
+    video_url = data.get('url')
+        
+    # Extract video ID from the URL
+    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
+    if not video_id_match:
+        return jsonify({'error': 'Invalid YouTube URL'}), 400
+    
+    video_id = video_id_match.group(1)  # Get the video ID
+    
+    # Create an S3 client
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+    )
+    
+    # Define the S3 bucket and key
+    bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")  # Get the bucket name from environment variable
+    s3_key = f"notes/{video_id}"  # Unique key for the markdown in S3
+    
+    try:
+        # Check if the markdown exists in S3
+        s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+        tutorial = s3_response['Body'].read().decode('utf-8')  # Read the markdown content
+        return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except s3_client.exceptions.NoSuchKey:
+        # If the markdown does not exist, return 404
+        return jsonify({'error': 'Tutorial not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == "__main__":
     app.run(debug=True)
