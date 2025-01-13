@@ -135,12 +135,36 @@ def generate_tutorial_endpoint():
     
     video_id = video_id_match.group(1)  # Get the video ID
     
+    # Create an S3 client
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+    )
+    
+    # Define the S3 bucket and key
+    bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")  # Get the bucket name from environment variable
+    s3_key = f"notes/{video_id}"  # Unique key for the markdown in S3
+    
     try:
-        # Generate the tutorial
-        tutorial = transcribe_youtube_video(video_id, video_url)
-        
-        # Return the markdown as plain text
-        return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        # Check if the markdown already exists in S3
+        try:
+            s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+            tutorial = s3_response['Body'].read().decode('utf-8')  # Read the markdown content
+            return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        except s3_client.exceptions.NoSuchKey:
+            # If the markdown does not exist, generate it
+            tutorial = transcribe_youtube_video(video_id, video_url)
+            
+            # Upload the markdown to S3
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=tutorial,
+                ContentType='text/plain'
+            )
+            
+            return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -168,45 +192,14 @@ def convert_html_to_pdf():
     
     if pisa_status.err:
         return jsonify({'error': 'Failed to create PDF'}), 500
-    
-    # Upload the PDF to S3
-    access_key = os.getenv("AWS_ACCESS_KEY_ID")  # Get the access key from environment variable
-    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")  # Get the secret key from environment variable
-    bucket_name = os.getenv("S3_BUCKET_NAME")  # Get the bucket name from environment variable
-    id = uuid.uuid4()
-    s3_key = f"pdfs/{uuid.uuid4()}.pdf"  # Unique key for the PDF in S3
 
-    # Before the upload
-    logging.info(f"Bucket Name: {bucket_name}")
-    logging.info(f"S3 Key: {s3_key}")
-    logging.info(f"Access Key: {access_key}")
-    logging.info(f"Secret Key: {secret_key}")
-
-    # Create an S3 client with access key and secret key
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key
-    )
-
-    try:
-        s3_client.upload_file(
-            pdf_path,
-            bucket_name,
-            s3_key,
-            ExtraArgs={'ContentType': 'application/pdf'}
-        )
-    except NoCredentialsError:
-        return jsonify({'error': 'Credentials not available'}), 500
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    # Return the PDF file directly from the endpoint
+    response = send_file(pdf_path, as_attachment=True, download_name='generated_pdf.pdf', mimetype='application/pdf')
     
-    if os.path.exists(pdf_path):
-        os.remove(pdf_path)  # Remove the temporary PDF file
+    # Remove the temporary file after sending the response
+    os.remove(pdf_path)
     
-    # Return the S3 URL of the uploaded PDF
-    s3_url = f"https://{bucket_name}.s3.amazonaws.com/{s3_key}"
-    return jsonify({'pdf_url': s3_url}), 200
+    return response
 
 if __name__ == "__main__":
     app.run(debug=True)
