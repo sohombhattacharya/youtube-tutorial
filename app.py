@@ -31,6 +31,7 @@ def generate_tutorial(transcript_data, youtube_url):
         "# Write up Generation from YouTube Transcript\n\n"
         "## Objective\n"
         "Create a detailed, comprehensive, and engaging write up based on a provided YouTube transcript."
+        "The transcript can be of various lengths. Do not ignore any information in the transcript. For example, if the transcript is longer than 2 hours, then you should continue to write the write up with the same level of detail."
         "The YouTube transcript is split into a list of dictionaries, each containing text and start time."
         "For example: {'text': 'Hello, my name is John', 'start': 100}. This means that the text 'Hello, my name is John' starts at 100 seconds into the video.\n\n"
         "The write up should be structured, informative, and easy to follow, providing readers with a clear understanding of the content discussed in the video.\n\n"
