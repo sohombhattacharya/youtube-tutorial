@@ -128,6 +128,7 @@ def transcribe_youtube_video(video_id, youtube_url):
 def generate_tutorial_endpoint():
     data = request.json
     video_url = data.get('url')
+    logging.info(f"Received request at /generate_tutorial with video_url: {video_url}")
         
     # Extract video ID from the URL
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
@@ -174,6 +175,7 @@ def convert_html_to_pdf():
     data = request.json
     html_content = data.get('html')
     youtube_url = data.get('url')  # Get the YouTube URL from the request
+    logging.info(f"Received request at /convert_html_to_pdf with video_url: {youtube_url}")
     
     if not html_content:
         return jsonify({'error': 'HTML content is required'}), 400
@@ -206,6 +208,7 @@ def convert_html_to_pdf():
 def get_tutorial():
     data = request.json
     video_url = data.get('url')
+    logging.info(f"Received request at /get_tutorial with video_url: {video_url}")
         
     # Extract video ID from the URL
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
