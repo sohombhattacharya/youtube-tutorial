@@ -284,7 +284,7 @@ def generate_quiz():
     prompt = (
         "Create a 10-question quiz based on the following markdown content. "
         "The questions should progressively increase in difficulty from easy to hard. "
-        "Return the quiz in a JSON object that is NOT wrapped in code blocks ``` with the following structure:\n"
+        "Return the quiz in a valid JSON object with the following example structure for 5 questions. The JSON object should NOT be wrapped in code blocks ``` ```. \n"
         "{\n"
         '  "quiz": {\n'
         '    "title": "Understanding NFL Sunday Ticket",\n'
