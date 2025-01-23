@@ -113,7 +113,7 @@ def transcribe_youtube_video(video_id, youtube_url):
     }
     
     # Fetch the transcript for the given video ID
-    transcript_data = YouTubeTranscriptApi.get_transcript(video_id, proxies=proxies, languages=["en", "es", "fr", "de", "it", "pt", "ru", "zh", "hi", "uk"])
+    transcript_data = YouTubeTranscriptApi.get_transcript(video_id, proxies=proxies, languages=["en", "es", "fr", "de", "it", "pt", "ru", "zh", "hi", "uk", "cs"])
 
     for entry in transcript_data:
         entry.pop('duration', None)
