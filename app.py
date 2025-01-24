@@ -13,6 +13,11 @@ from botocore.exceptions import NoCredentialsError
 import time  # Import time for generating unique filenames
 import uuid
 import json
+import jwt
+from jwt import PyJWKClient  # Add this import
+import ssl
+import certifi  # Add this import
+
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
@@ -22,6 +27,26 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+
+# Add these Auth0 configuration settings after app initialization
+AUTH0_DOMAIN = os.getenv('AUTH0_DOMAIN')
+if not AUTH0_DOMAIN:
+    logging.error("AUTH0_DOMAIN environment variable is not set!")
+    raise ValueError("AUTH0_DOMAIN must be configured")
+
+AUTH0_ALGORITHMS = ['RS256']
+jwks_url = f'https://{AUTH0_DOMAIN}/.well-known/jwks.json'
+logging.info(f"Auth0 Domain: {AUTH0_DOMAIN}")
+logging.info(f"JWKS URL: {jwks_url}")
+
+try:
+    # Create JWKS client with SSL context
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    jwks_client = PyJWKClient(jwks_url, ssl_context=ssl_context)
+    logging.info("Successfully initialized JWKS client")
+except Exception as e:
+    logging.error(f"Failed to initialize JWKS client: {type(e).__name__}: {str(e)}")
+    raise
 
 def validate_token(token):
     return token == os.getenv("API_KEY")
@@ -127,6 +152,33 @@ def transcribe_youtube_video(video_id, youtube_url):
 
 @app.route('/generate_tutorial', methods=['POST'])
 def generate_tutorial_endpoint():
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        try:
+            # Log unverified token contents first to see what issuer we're getting
+            unverified = jwt.decode(token, options={"verify_signature": False})
+            logging.info(f"Unverified token contents: {unverified}")
+            logging.info(f"Expected issuer: https://{AUTH0_DOMAIN}/")
+            
+            # Get the signing key
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            
+            # Decode and verify the token
+            decoded_token = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=AUTH0_ALGORITHMS,
+                audience=os.getenv('AUTH0_AUDIENCE'),
+                issuer=f'https://{AUTH0_DOMAIN}/'  # Make sure this matches exactly
+            )
+            logging.info(f"Verified JWT token contents: {decoded_token}")
+        except jwt.InvalidTokenError as e:
+            logging.error(f"Invalid JWT token: {str(e)}")
+            logging.error(f"Token issuer validation failed. Token: {token[:10]}...")
+        except Exception as e:
+            logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
+
     data = request.json
     video_url = data.get('url')
     logging.info(f"Received request at /generate_tutorial with video_url: {video_url}")
