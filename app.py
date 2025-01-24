@@ -15,12 +15,43 @@ import uuid
 import json
 import jwt
 from jwt import PyJWKClient  # Add this import
-import ssl
-import certifi  # Add this import
+from psycopg2 import pool
+import psycopg2.extras
+import atexit
 
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
+
+# Initialize the connection pool
+try:
+    app.db_pool = psycopg2.pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=10,  # Adjust based on your needs
+        dbname=os.getenv('DB_NAME'),
+        user=os.getenv('DB_USER'),
+        password=os.getenv('DB_PASSWORD'),
+        host=os.getenv('DB_HOST'),
+        port=os.getenv('DB_PORT')
+    )
+    logging.info("Successfully created database connection pool")
+except Exception as e:
+    logging.error(f"Failed to create database connection pool: {str(e)}")
+    raise
+
+# Add teardown context to return connections to pool
+@app.teardown_appcontext
+def close_db_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        app.db_pool.putconn(db)
+        g._database = None
+
+# Helper function to get connection from pool
+def get_db_connection():
+    if not hasattr(g, '_database'):
+        g._database = app.db_pool.getconn()
+    return g._database
 
 # Configure the Gemini API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -152,7 +183,11 @@ def transcribe_youtube_video(video_id, youtube_url):
 
 @app.route('/generate_tutorial', methods=['POST'])
 def generate_tutorial_endpoint():
+    # Check for Bearer token
     auth_header = request.headers.get('Authorization')
+    visitor_id = request.json.get('visitor_id')
+
+    # Process Bearer token if present
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
         try:
@@ -170,15 +205,37 @@ def generate_tutorial_endpoint():
                 signing_key.key,
                 algorithms=AUTH0_ALGORITHMS,
                 audience=os.getenv('AUTH0_AUDIENCE'),
-                issuer=f'https://{AUTH0_DOMAIN}/'  # Make sure this matches exactly
+                issuer=f'https://{AUTH0_DOMAIN}/'
             )
             logging.info(f"Verified JWT token contents: {decoded_token}")
         except jwt.InvalidTokenError as e:
             logging.error(f"Invalid JWT token: {str(e)}")
             logging.error(f"Token issuer validation failed. Token: {token[:10]}...")
+            return jsonify({'error': 'Invalid authentication token'}), 401
         except Exception as e:
             logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
+            return jsonify({'error': 'Authentication error'}), 401
 
+    # Check visitor note limits if using visitor_id
+    if visitor_id:
+        try:
+            conn = get_db_connection()
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                # Count existing notes for this visitor
+                cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
+                note_count = cur.fetchone()[0]
+                
+                if note_count >= 5:
+                    return jsonify({
+                        'error': 'Free note limit reached',
+                        'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
+                    }), 403
+
+        except Exception as e:
+            logging.error(f"Database error checking visitor notes: {str(e)}")
+            return jsonify({'error': 'Internal server error'}), 500
+
+    # Continue with the rest of the endpoint logic
     data = request.json
     video_url = data.get('url')
     logging.info(f"Received request at /generate_tutorial with video_url: {video_url}")
@@ -206,6 +263,22 @@ def generate_tutorial_endpoint():
         try:
             s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
             tutorial = s3_response['Body'].read().decode('utf-8')  # Read the markdown content
+
+            # If visitor_id is provided, insert a record into visitor_notes
+            if visitor_id:
+                try:
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO visitor_notes (visitor_id, video_id) VALUES (%s, %s)",
+                            (visitor_id, video_id)
+                        )
+                    conn.commit()
+                except Exception as e:
+                    logging.error(f"Error inserting visitor note: {str(e)}")
+                    # Continue execution even if insert fails
+                    pass
+
             return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
         except s3_client.exceptions.NoSuchKey:
             # If the markdown does not exist, generate it
@@ -219,6 +292,21 @@ def generate_tutorial_endpoint():
                 ContentType='text/plain'
             )
             
+            # If visitor_id is provided, insert a record into visitor_notes
+            if visitor_id:
+                try:
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO visitor_notes (visitor_id, video_id) VALUES (%s, %s)",
+                            (visitor_id, video_id)
+                        )
+                    conn.commit()
+                except Exception as e:
+                    logging.error(f"Error inserting visitor note: {str(e)}")
+                    # Continue execution even if insert fails
+                    pass
+
             return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except Exception as e:
         return jsonify({'error': str(e)}), 500
