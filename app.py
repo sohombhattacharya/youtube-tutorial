@@ -1,10 +1,28 @@
-from flask import Flask, request, jsonify, send_file, abort
+import logging
+import sys
+import os
+
+# Configure logging - must be first!
+log_level = logging.DEBUG if os.getenv('APP_ENV') == 'development' else logging.INFO
+
+logging.basicConfig(
+    level=log_level,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)  # Explicitly use stdout
+    ],
+    force=True  # Force override any existing configuration
+)
+
+logging.info("=== Application Starting ===")
+logging.debug("Debug logging enabled - running in development mode")
+
+from flask import Flask, request, jsonify, send_file, abort, g
 from flask_cors import CORS
 import os
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
-import logging
 from dotenv import load_dotenv
 import tempfile
 from xhtml2pdf import pisa
@@ -18,10 +36,20 @@ from jwt import PyJWKClient  # Add this import
 from psycopg2 import pool
 import psycopg2.extras
 import atexit
+import ssl
+import certifi
 
 load_dotenv()
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "https://swiftnotes.ai"
+        ]
+    }
+})
 
 # Initialize the connection pool
 try:
@@ -55,9 +83,6 @@ def get_db_connection():
 
 # Configure the Gemini API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 
 # Add these Auth0 configuration settings after app initialization
 AUTH0_DOMAIN = os.getenv('AUTH0_DOMAIN')
@@ -184,7 +209,9 @@ def transcribe_youtube_video(video_id, youtube_url):
 @app.route('/generate_tutorial', methods=['POST'])
 def generate_tutorial_endpoint():
     # Check for Bearer token
+    logging.debug(f"Request headers: {request.headers}")
     auth_header = request.headers.get('Authorization')
+    logging.debug(f"Authorization header: {auth_header}")
     visitor_id = request.json.get('visitor_id')
 
     # Process Bearer token if present
@@ -193,8 +220,8 @@ def generate_tutorial_endpoint():
         try:
             # Log unverified token contents first to see what issuer we're getting
             unverified = jwt.decode(token, options={"verify_signature": False})
-            logging.info(f"Unverified token contents: {unverified}")
-            logging.info(f"Expected issuer: https://{AUTH0_DOMAIN}/")
+            logging.debug(f"Unverified token contents: {unverified}")
+            logging.debug(f"Expected issuer: https://{AUTH0_DOMAIN}/")
             
             # Get the signing key
             signing_key = jwks_client.get_signing_key_from_jwt(token)
@@ -207,7 +234,7 @@ def generate_tutorial_endpoint():
                 audience=os.getenv('AUTH0_AUDIENCE'),
                 issuer=f'https://{AUTH0_DOMAIN}/'
             )
-            logging.info(f"Verified JWT token contents: {decoded_token}")
+            logging.debug(f"Verified JWT token contents: {decoded_token}")
         except jwt.InvalidTokenError as e:
             logging.error(f"Invalid JWT token: {str(e)}")
             logging.error(f"Token issuer validation failed. Token: {token[:10]}...")
@@ -216,20 +243,38 @@ def generate_tutorial_endpoint():
             logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
             return jsonify({'error': 'Authentication error'}), 401
 
-    # Check visitor note limits if using visitor_id
+    # Check if visitor has already viewed this note
+    video_url = request.json.get('url')
+    
+    # Extract video ID from the URL
+    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
+    if not video_id_match:
+        return jsonify({'error': 'Invalid YouTube URL'}), 400
+    
+    video_id = video_id_match.group(1)
+
+    # If visitor_id is provided, check if they've already viewed this note
     if visitor_id:
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Count existing notes for this visitor
-                cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
-                note_count = cur.fetchone()[0]
+                # Check if visitor has already viewed this note
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM visitor_notes WHERE visitor_id = %s AND youtube_video_id = %s)",
+                    (visitor_id, video_id)
+                )
+                has_viewed = cur.fetchone()[0]
                 
-                if note_count >= 5:
-                    return jsonify({
-                        'error': 'Free note limit reached',
-                        'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
-                    }), 403
+                if not has_viewed:
+                    # If they haven't viewed it before, check their total note count
+                    cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
+                    note_count = cur.fetchone()[0]
+                    
+                    if note_count >= 7:
+                        return jsonify({
+                            'error': 'Free note limit reached',
+                            'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
+                        }), 403
 
         except Exception as e:
             logging.error(f"Database error checking visitor notes: {str(e)}")
@@ -240,13 +285,6 @@ def generate_tutorial_endpoint():
     video_url = data.get('url')
     logging.info(f"Received request at /generate_tutorial with video_url: {video_url}")
         
-    # Extract video ID from the URL
-    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
-    if not video_id_match:
-        return jsonify({'error': 'Invalid YouTube URL'}), 400
-    
-    video_id = video_id_match.group(1)  # Get the video ID
-    
     # Create an S3 client
     s3_client = boto3.client(
         's3',
@@ -270,13 +308,17 @@ def generate_tutorial_endpoint():
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute(
-                            "INSERT INTO visitor_notes (visitor_id, video_id) VALUES (%s, %s)",
+                            """
+                            INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
+                            VALUES (%s, %s) 
+                            ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                            """,
                             (visitor_id, video_id)
                         )
                     conn.commit()
                 except Exception as e:
-                    logging.error(f"Error inserting visitor note: {str(e)}")
-                    # Continue execution even if insert fails
+                    logging.error(f"Error handling visitor note: {str(e)}")
+                    # Continue execution even if operation fails
                     pass
 
             return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
@@ -298,13 +340,17 @@ def generate_tutorial_endpoint():
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute(
-                            "INSERT INTO visitor_notes (visitor_id, video_id) VALUES (%s, %s)",
+                            """
+                            INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
+                            VALUES (%s, %s) 
+                            ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                            """,
                             (visitor_id, video_id)
                         )
                     conn.commit()
                 except Exception as e:
-                    logging.error(f"Error inserting visitor note: {str(e)}")
-                    # Continue execution even if insert fails
+                    logging.error(f"Error handling visitor note: {str(e)}")
+                    # Continue execution even if operation fails
                     pass
 
             return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
@@ -347,8 +393,40 @@ def convert_html_to_pdf():
 
 @app.route('/get_tutorial', methods=['POST'])
 def get_tutorial():
+    # Check for Bearer token
+    logging.debug(f"Request headers: {request.headers}")
+    auth_header = request.headers.get('Authorization')
+    logging.debug(f"Authorization header: {auth_header}")
+
+    # Process Bearer token if present
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        try:
+            # Log unverified token contents first
+            unverified = jwt.decode(token, options={"verify_signature": False})
+            logging.debug(f"Unverified token contents: {unverified}")
+            logging.debug(f"Expected issuer: https://{AUTH0_DOMAIN}/")
+            
+            # Get the signing key and verify token
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            decoded_token = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=AUTH0_ALGORITHMS,
+                audience=os.getenv('AUTH0_AUDIENCE'),
+                issuer=f'https://{AUTH0_DOMAIN}/'
+            )
+            logging.debug(f"Verified JWT token contents: {decoded_token}")
+        except jwt.InvalidTokenError as e:
+            logging.error(f"Invalid JWT token: {str(e)}")
+            return jsonify({'error': 'Invalid authentication token'}), 401
+        except Exception as e:
+            logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
+            return jsonify({'error': 'Authentication error'}), 401
+
     data = request.json
     video_url = data.get('url')
+    visitor_id = data.get('visitor_id')
     logging.info(f"Received request at /get_tutorial with video_url: {video_url}")
         
     # Extract video ID from the URL
@@ -356,7 +434,34 @@ def get_tutorial():
     if not video_id_match:
         return jsonify({'error': 'Invalid YouTube URL'}), 400
     
-    video_id = video_id_match.group(1)  # Get the video ID
+    video_id = video_id_match.group(1)
+
+    # If visitor_id is provided, check their note access
+    if visitor_id:
+        try:
+            conn = get_db_connection()
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                # Check if visitor has already viewed this note
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM visitor_notes WHERE visitor_id = %s AND youtube_video_id = %s)",
+                    (visitor_id, video_id)
+                )
+                has_viewed = cur.fetchone()[0]
+                
+                if not has_viewed:
+                    # If they haven't viewed it before, check their total note count
+                    cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
+                    note_count = cur.fetchone()[0]
+                    
+                    if note_count >= 7:
+                        return jsonify({
+                            'error': 'Free note limit reached',
+                            'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
+                        }), 403
+
+        except Exception as e:
+            logging.error(f"Database error checking visitor notes: {str(e)}")
+            return jsonify({'error': 'Internal server error'}), 500
     
     # Create an S3 client
     s3_client = boto3.client(
@@ -365,17 +470,34 @@ def get_tutorial():
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
     )
     
-    # Define the S3 bucket and key
-    bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")  # Get the bucket name from environment variable
-    s3_key = f"notes/{video_id}"  # Unique key for the markdown in S3
+    bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+    s3_key = f"notes/{video_id}"
     
     try:
         # Check if the markdown exists in S3
         s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
-        tutorial = s3_response['Body'].read().decode('utf-8')  # Read the markdown content
+        tutorial = s3_response['Body'].read().decode('utf-8')
+
+        # If visitor_id is provided and they haven't viewed this note before, record it
+        if visitor_id:
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
+                        VALUES (%s, %s) 
+                        ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                        """,
+                        (visitor_id, video_id)
+                    )
+                conn.commit()
+            except Exception as e:
+                logging.error(f"Error recording visitor note: {str(e)}")
+                # Continue execution even if this fails
+
         return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except s3_client.exceptions.NoSuchKey:
-        # If the markdown does not exist, return 404
         return jsonify({'error': 'Tutorial not found'}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -494,6 +616,31 @@ def generate_quiz():
             return jsonify({'error': 'Failed to upload quiz to S3'}), 500
     else:
         return jsonify({'error': 'Failed to generate quiz'}), 500
+
+@app.route('/get_visitor_notes', methods=['POST'])
+def get_visitor_notes():
+    data = request.json
+    visitor_id = data.get('visitor_id')
+    
+    if not visitor_id:
+        return jsonify({'error': 'Visitor ID is required'}), 400
+        
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Count existing notes for this visitor
+            cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
+            used_notes = cur.fetchone()[0]
+
+            
+            return jsonify({
+                'used_notes': used_notes,
+                'total_free_notes': 7
+            }), 200
+
+    except Exception as e:
+        logging.error(f"Database error checking visitor notes: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
