@@ -215,19 +215,14 @@ def generate_tutorial_endpoint():
     logging.debug(f"Authorization header: {auth_header}")
     visitor_id = request.json.get('visitor_id')
 
+    subscription_status = 'INACTIVE'  # Default status
+    
     # Process Bearer token if present
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
         try:
-            # Log unverified token contents first to see what issuer we're getting
-            unverified = jwt.decode(token, options={"verify_signature": False})
-            logging.debug(f"Unverified token contents: {unverified}")
-            logging.debug(f"Expected issuer: https://{AUTH0_DOMAIN}/")
-            
-            # Get the signing key
+            # Verify token and get user's subscription status
             signing_key = jwks_client.get_signing_key_from_jwt(token)
-            
-            # Decode and verify the token
             decoded_token = jwt.decode(
                 token,
                 signing_key.key,
@@ -235,18 +230,28 @@ def generate_tutorial_endpoint():
                 audience=os.getenv('AUTH0_AUDIENCE'),
                 issuer=f'https://{AUTH0_DOMAIN}/'
             )
-            logging.debug(f"Verified JWT token contents: {decoded_token}")
-        except jwt.InvalidTokenError as e:
-            logging.error(f"Invalid JWT token: {str(e)}")
-            logging.error(f"Token issuer validation failed. Token: {token[:10]}...")
-            return jsonify({'error': 'Invalid authentication token'}), 401
+            
+            # Get user's subscription status from database
+            auth0_id = decoded_token['sub']
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT subscription_status FROM users WHERE auth0_id = %s",
+                    (auth0_id,)
+                )
+                result = cur.fetchone()
+                if result:
+                    subscription_status = result[0]
+                    
         except Exception as e:
-            logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
-            return jsonify({'error': 'Authentication error'}), 401
+            logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
+            # Continue execution with default INACTIVE status
 
-    # Check if visitor has already viewed this note
-    video_url = request.json.get('url')
-    
+    # Continue with the rest of the endpoint logic
+    data = request.json
+    video_url = data.get('url')
+    logging.info(f"Received request at /generate_tutorial with video_url: {video_url}")
+        
     # Extract video ID from the URL
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
     if not video_id_match:
@@ -254,8 +259,8 @@ def generate_tutorial_endpoint():
     
     video_id = video_id_match.group(1)
 
-    # If visitor_id is provided, check if they've already viewed this note
-    if visitor_id:
+    # Check note access only if user is not ACTIVE
+    if subscription_status != 'ACTIVE' and visitor_id:
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -281,11 +286,6 @@ def generate_tutorial_endpoint():
             logging.error(f"Database error checking visitor notes: {str(e)}")
             return jsonify({'error': 'Internal server error'}), 500
 
-    # Continue with the rest of the endpoint logic
-    data = request.json
-    video_url = data.get('url')
-    logging.info(f"Received request at /generate_tutorial with video_url: {video_url}")
-        
     # Create an S3 client
     s3_client = boto3.client(
         's3',
@@ -303,8 +303,8 @@ def generate_tutorial_endpoint():
             s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
             tutorial = s3_response['Body'].read().decode('utf-8')  # Read the markdown content
 
-            # If visitor_id is provided, insert a record into visitor_notes
-            if visitor_id:
+            # Record the view only if user is not ACTIVE and visitor_id is provided
+            if subscription_status != 'ACTIVE' and visitor_id:
                 try:
                     conn = get_db_connection()
                     with conn.cursor() as cur:
@@ -335,8 +335,8 @@ def generate_tutorial_endpoint():
                 ContentType='text/plain'
             )
             
-            # If visitor_id is provided, insert a record into visitor_notes
-            if visitor_id:
+            # Record the view only if user is not ACTIVE and visitor_id is provided
+            if subscription_status != 'ACTIVE' and visitor_id:
                 try:
                     conn = get_db_connection()
                     with conn.cursor() as cur:
@@ -398,17 +398,18 @@ def get_tutorial():
     logging.debug(f"Request headers: {request.headers}")
     auth_header = request.headers.get('Authorization')
     logging.debug(f"Authorization header: {auth_header}")
-
+    
+    data = request.json
+    video_url = data.get('url')
+    visitor_id = data.get('visitor_id')  # This will always be present
+    
+    subscription_status = 'INACTIVE'  # Default status
+    
     # Process Bearer token if present
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
         try:
-            # Log unverified token contents first
-            unverified = jwt.decode(token, options={"verify_signature": False})
-            logging.debug(f"Unverified token contents: {unverified}")
-            logging.debug(f"Expected issuer: https://{AUTH0_DOMAIN}/")
-            
-            # Get the signing key and verify token
+            # Verify token and get user's subscription status
             signing_key = jwks_client.get_signing_key_from_jwt(token)
             decoded_token = jwt.decode(
                 token,
@@ -417,17 +418,23 @@ def get_tutorial():
                 audience=os.getenv('AUTH0_AUDIENCE'),
                 issuer=f'https://{AUTH0_DOMAIN}/'
             )
-            logging.debug(f"Verified JWT token contents: {decoded_token}")
-        except jwt.InvalidTokenError as e:
-            logging.error(f"Invalid JWT token: {str(e)}")
-            return jsonify({'error': 'Invalid authentication token'}), 401
+            
+            # Get user's subscription status from database
+            auth0_id = decoded_token['sub']
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT subscription_status FROM users WHERE auth0_id = %s",
+                    (auth0_id,)
+                )
+                result = cur.fetchone()
+                if result:
+                    subscription_status = result[0]
+                    
         except Exception as e:
-            logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
-            return jsonify({'error': 'Authentication error'}), 401
-
-    data = request.json
-    video_url = data.get('url')
-    visitor_id = data.get('visitor_id')
+            logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
+            # Continue execution with default INACTIVE status
+    
     logging.info(f"Received request at /get_tutorial with video_url: {video_url}")
         
     # Extract video ID from the URL
@@ -437,8 +444,8 @@ def get_tutorial():
     
     video_id = video_id_match.group(1)
 
-    # If visitor_id is provided, check their note access
-    if visitor_id:
+    # Check note access only if user is not ACTIVE
+    if subscription_status != 'ACTIVE':
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -479,8 +486,8 @@ def get_tutorial():
         s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
         tutorial = s3_response['Body'].read().decode('utf-8')
 
-        # If visitor_id is provided and they haven't viewed this note before, record it
-        if visitor_id:
+        # Record the view only if user is not ACTIVE
+        if subscription_status != 'ACTIVE':
             try:
                 conn = get_db_connection()
                 with conn.cursor() as cur:
@@ -684,15 +691,17 @@ def stripe_webhook():
             try:
                 if event.type == 'customer.subscription.created':
                     subscription = event.data.object
+                    email = stripe.Customer.retrieve(subscription.customer).email
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute("""
                             UPDATE users 
-                            SET subscription_status = 'active',
+                            SET subscription_status = 'ACTIVE',
                                 subscription_id = %s,
+                                stripe_customer_id = %s,
                                 updated_at = NOW()
-                            WHERE stripe_customer_id = %s
-                        """, (subscription.id, subscription.customer))
+                            WHERE email = %s
+                        """, (subscription.id, subscription.customer, email))
                         
                         # Update webhook log with processing status
                         cur.execute("""
@@ -703,7 +712,7 @@ def stripe_webhook():
                             WHERE id = %s
                         """, (webhook_log_id,))
                     conn.commit()
-                    logging.info(f"New subscription created for customer {subscription.customer}")
+                    logging.info(f"New subscription created for customer {email}")
                     
                 elif event.type == 'invoice.paid':
                     invoice = event.data.object
@@ -754,7 +763,7 @@ def stripe_webhook():
                     with conn.cursor() as cur:
                         cur.execute("""
                             UPDATE users 
-                            SET subscription_status = 'inactive',
+                            SET subscription_status = 'INACTIVE',
                                 subscription_id = NULL,
                                 updated_at = NOW()
                             WHERE stripe_customer_id = %s
@@ -827,24 +836,19 @@ def stripe_webhook():
             
         return jsonify({'error': error_msg}), 400
 
-@app.route('/get_user', methods=['POST'])
+@app.route('/get_user', methods=['GET'])
 def get_user():
     # Check for Bearer token
-    logging.debug(f"Request headers: {request.headers}")
     auth_header = request.headers.get('Authorization')
-    logging.debug(f"Authorization header: {auth_header}")
+    email = request.args.get('email')
 
     if not auth_header or not auth_header.startswith('Bearer '):
         return jsonify({'error': 'No authentication token provided'}), 401
 
     token = auth_header.split(' ')[1]
     try:
-        # Log unverified token contents first
-        unverified = jwt.decode(token, options={"verify_signature": False})
-        logging.debug(f"Unverified token contents: {unverified}")
-        logging.debug(f"Expected issuer: https://{AUTH0_DOMAIN}/")
-        
         # Get the signing key and verify token
+        logging.info(f"Token: {token}")
         signing_key = jwks_client.get_signing_key_from_jwt(token)
         decoded_token = jwt.decode(
             token,
@@ -853,11 +857,9 @@ def get_user():
             audience=os.getenv('AUTH0_AUDIENCE'),
             issuer=f'https://{AUTH0_DOMAIN}/'
         )
-        logging.debug(f"Verified JWT token contents: {decoded_token}")
 
         # Extract user info from token
         auth0_id = decoded_token['sub']
-        email = decoded_token.get('email', '')
 
         try:
             conn = get_db_connection()
@@ -890,7 +892,7 @@ def get_user():
                     'auth0_id': user['auth0_id'],
                     'subscription_status': user['subscription_status'],
                 }
-                
+                logging.info(f"User data: {user_data}")
                 return jsonify(user_data), 200
 
         except Exception as e:
@@ -903,6 +905,65 @@ def get_user():
     except Exception as e:
         logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Authentication error'}), 401
+
+@app.route('/cancel_subscription', methods=['POST'])
+def cancel_subscription():
+    # Check for Bearer token
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({'error': 'No authentication token provided'}), 401
+
+    token = auth_header.split(' ')[1]
+    try:
+        # Verify token and get user info
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        decoded_token = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=AUTH0_ALGORITHMS,
+            audience=os.getenv('AUTH0_AUDIENCE'),
+            issuer=f'https://{AUTH0_DOMAIN}/'
+        )
+        auth0_id = decoded_token['sub']
+
+        # Get user's subscription info from database
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("""
+                SELECT subscription_id, stripe_customer_id
+                FROM users 
+                WHERE auth0_id = %s
+            """, (auth0_id,))
+            user = cur.fetchone()
+
+            if not user or not user['subscription_id']:
+                return jsonify({'error': 'No active subscription found'}), 404
+
+            try:
+                # Cancel the subscription at period end
+                subscription = stripe.Subscription.modify(
+                    user['subscription_id'],
+                    cancel_at_period_end=True
+                )
+
+                # Note: We're not updating the subscription_status here anymore
+                # It will remain ACTIVE until the subscription actually ends
+
+                return jsonify({
+                    'message': 'Subscription will be canceled at the end of the billing period',
+                    'cancel_at': subscription.cancel_at
+                }), 200
+
+            except stripe.error.StripeError as e:
+                logging.error(f"Stripe error: {str(e)}")
+                return jsonify({'error': 'Failed to cancel subscription'}), 500
+
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in cancel_subscription: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)

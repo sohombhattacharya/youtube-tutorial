@@ -33,7 +33,7 @@ CREATE TABLE webhook_logs (
     processing_status TEXT DEFAULT 'pending',
     processing_details TEXT,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    processed_at TIMESTAMP WITH TIME ZONE NOT NULL 
+    processed_at TIMESTAMP WITH TIME ZONE
 );
 
 -- Index for faster lookups
@@ -48,5 +48,6 @@ CREATE TABLE users (
     stripe_customer_id TEXT UNIQUE,
     subscription_id TEXT,
     subscription_status TEXT NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
