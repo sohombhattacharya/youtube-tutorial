@@ -712,7 +712,7 @@ def stripe_webhook():
                             WHERE id = %s
                         """, (webhook_log_id,))
                     conn.commit()
-                    logging.info(f"New subscription created for customer {email}")
+                    logging.info(f"New subscription created for customer {subscription.customer}")
                     
                 elif event.type == 'invoice.paid':
                     invoice = event.data.object
@@ -848,7 +848,6 @@ def get_user():
     token = auth_header.split(' ')[1]
     try:
         # Get the signing key and verify token
-        logging.info(f"Token: {token}")
         signing_key = jwks_client.get_signing_key_from_jwt(token)
         decoded_token = jwt.decode(
             token,
@@ -892,7 +891,6 @@ def get_user():
                     'auth0_id': user['auth0_id'],
                     'subscription_status': user['subscription_status'],
                 }
-                logging.info(f"User data: {user_data}")
                 return jsonify(user_data), 200
 
         except Exception as e:
