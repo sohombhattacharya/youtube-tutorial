@@ -865,7 +865,7 @@ def get_user():
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                 # Try to find existing user
                 cur.execute("""
-                    SELECT id, email, auth0_id, subscription_status
+                    SELECT id, email, auth0_id, subscription_status, subscription_cancelled_period_ends_at
                     FROM users 
                     WHERE auth0_id = %s
                 """, (auth0_id,))
@@ -878,18 +878,21 @@ def get_user():
                         INSERT INTO users 
                         (email, auth0_id, subscription_status, created_at, updated_at)
                         VALUES (%s, %s, 'INACTIVE', NOW(), NOW())
-                        RETURNING id, email, auth0_id, subscription_status
+                        RETURNING id, email, auth0_id, subscription_status, subscription_cancelled_period_ends_at
                     """, (email, auth0_id))
                     user = cur.fetchone()
                     conn.commit()
                     logging.info(f"Created new user with auth0_id: {auth0_id}")
                 
+                logging.debug(f"User data: {user['subscription_cancelled_period_ends_at']}")
+
                 # Convert to dictionary for JSON response
                 user_data = {
                     'id': user['id'],
                     'email': user['email'],
                     'auth0_id': user['auth0_id'],
                     'subscription_status': user['subscription_status'],
+                    'subscription_ends_at': user['subscription_cancelled_period_ends_at'].isoformat() if user['subscription_cancelled_period_ends_at'] else None,
                 }
                 return jsonify(user_data), 200
 
@@ -965,6 +968,7 @@ def cancel_subscription():
             user = retry_operation(get_user_subscription)
             if not user or not user['subscription_id']:
                 return jsonify({'error': 'No active subscription found'}), 404
+
         except Exception as e:
             logging.error(f"Database error getting user subscription: {str(e)}")
             return jsonify({'error': 'Internal server error'}), 500

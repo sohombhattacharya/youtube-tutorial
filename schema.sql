@@ -18,7 +18,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO swiftnotesad
 
 
 CREATE TABLE visitor_notes (
-    visitor_id UUID NOT NULL,  
+    visitor_id TEXT NOT NULL,  
     youtube_video_id TEXT NOT NULL, 
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (visitor_id, youtube_video_id)
