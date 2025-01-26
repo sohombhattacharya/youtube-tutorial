@@ -914,55 +914,102 @@ def cancel_subscription():
         return jsonify({'error': 'No authentication token provided'}), 401
 
     token = auth_header.split(' ')[1]
+    max_retries = 3
+    base_delay = 1  # Base delay in seconds
+
+    # Function to handle retries with exponential backoff
+    def retry_operation(operation, *args, **kwargs):
+        for attempt in range(max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    raise  # Re-raise the last exception
+                delay = base_delay * (2 ** attempt)  # Exponential backoff
+                logging.warning(f"Attempt {attempt + 1} failed: {str(e)}. Retrying in {delay} seconds...")
+                time.sleep(delay)
+
     try:
         # Verify token and get user info
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
-        decoded_token = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=AUTH0_ALGORITHMS,
-            audience=os.getenv('AUTH0_AUDIENCE'),
-            issuer=f'https://{AUTH0_DOMAIN}/'
-        )
+        def verify_token():
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            return jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=AUTH0_ALGORITHMS,
+                audience=os.getenv('AUTH0_AUDIENCE'),
+                issuer=f'https://{AUTH0_DOMAIN}/'
+            )
+
+        try:
+            decoded_token = retry_operation(verify_token)
+        except jwt.InvalidTokenError as e:
+            logging.error(f"Invalid JWT token: {str(e)}")
+            return jsonify({'error': 'Invalid authentication token'}), 401
+        except Exception as e:
+            logging.error(f"Error verifying token: {type(e).__name__}: {str(e)}")
+            return jsonify({'error': 'Authentication error'}), 401
+
         auth0_id = decoded_token['sub']
 
         # Get user's subscription info from database
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("""
-                SELECT subscription_id, stripe_customer_id
-                FROM users 
-                WHERE auth0_id = %s
-            """, (auth0_id,))
-            user = cur.fetchone()
+        def get_user_subscription():
+            conn = get_db_connection()
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("""
+                    SELECT subscription_id, stripe_customer_id
+                    FROM users 
+                    WHERE auth0_id = %s
+                """, (auth0_id,))
+                return cur.fetchone()
 
+        try:
+            user = retry_operation(get_user_subscription)
             if not user or not user['subscription_id']:
                 return jsonify({'error': 'No active subscription found'}), 404
+        except Exception as e:
+            logging.error(f"Database error getting user subscription: {str(e)}")
+            return jsonify({'error': 'Internal server error'}), 500
 
-            try:
-                # Cancel the subscription at period end
-                subscription = stripe.Subscription.modify(
-                    user['subscription_id'],
-                    cancel_at_period_end=True
-                )
+        # Cancel the subscription with Stripe
+        def cancel_stripe_subscription():
+            return stripe.Subscription.modify(
+                user['subscription_id'],
+                cancel_at_period_end=True
+            )
 
-                # Note: We're not updating the subscription_status here anymore
-                # It will remain ACTIVE until the subscription actually ends
+        try:
+            subscription = retry_operation(cancel_stripe_subscription)
+        except stripe.error.StripeError as e:
+            logging.error(f"Stripe error: {str(e)}")
+            return jsonify({'error': 'Failed to cancel subscription'}), 500
 
-                return jsonify({
-                    'message': 'Subscription will be canceled at the end of the billing period',
-                    'cancel_at': subscription.cancel_at
-                }), 200
+        # Update database with cancellation info
+        def update_user_cancellation():
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE users 
+                    SET subscription_cancelled_at = NOW(),
+                        subscription_cancelled_period_ends_at = to_timestamp(%s)
+                    WHERE auth0_id = %s
+                """, (subscription.current_period_end, auth0_id))
+                conn.commit()
 
-            except stripe.error.StripeError as e:
-                logging.error(f"Stripe error: {str(e)}")
-                return jsonify({'error': 'Failed to cancel subscription'}), 500
+        try:
+            retry_operation(update_user_cancellation)
+        except Exception as e:
+            logging.error(f"Database error updating cancellation info: {str(e)}")
+            # Note: Subscription is already cancelled in Stripe at this point
+            return jsonify({'error': 'Subscription cancelled but failed to update database'}), 500
 
-    except jwt.InvalidTokenError as e:
-        logging.error(f"Invalid JWT token: {str(e)}")
-        return jsonify({'error': 'Invalid authentication token'}), 401
+        return jsonify({
+            'message': 'Subscription will be canceled at the end of the billing period',
+            'current_period_end': subscription.current_period_end,
+        }), 200
+
     except Exception as e:
-        logging.error(f"Error in cancel_subscription: {type(e).__name__}: {str(e)}")
+        logging.error(f"Unexpected error in cancel_subscription: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == "__main__":
