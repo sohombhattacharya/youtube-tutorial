@@ -1,6 +1,7 @@
 import logging
 import sys
 import os
+import stripe  # Add this import at the top with other imports
 
 # Configure logging - must be first!
 log_level = logging.DEBUG if os.getenv('APP_ENV') == 'development' else logging.INFO
@@ -641,6 +642,267 @@ def get_visitor_notes():
     except Exception as e:
         logging.error(f"Database error checking visitor notes: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
+
+# Add Stripe configuration after other configurations
+stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
+endpoint_secret = os.getenv('STRIPE_WEBHOOK_SECRET')
+
+@app.route('/webhook/stripe', methods=['POST'])
+def stripe_webhook():
+    payload = request.data.decode("utf-8")
+    signature = request.headers.get('Stripe-Signature')
+
+    try:
+        # Verify Stripe signature
+        event = stripe.Webhook.construct_event(payload, signature, endpoint_secret)
+        
+        # Extract customer ID from the event
+        customer_id = event.data.object.customer
+
+        # Log the webhook event with customer ID
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO webhook_logs 
+                (stripe_event_id, event_type, event_data, stripe_customer_id, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                RETURNING id
+            """, (
+                event.id,
+                event.type,
+                json.dumps(event.data.object),
+                customer_id
+            ))
+            webhook_log_id = cur.fetchone()[0]
+            conn.commit()
+        
+        # Process the event with retries
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                if event.type == 'customer.subscription.created':
+                    subscription = event.data.object
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE users 
+                            SET subscription_status = 'active',
+                                subscription_id = %s,
+                                updated_at = NOW()
+                            WHERE stripe_customer_id = %s
+                        """, (subscription.id, subscription.customer))
+                        
+                        # Update webhook log with processing status
+                        cur.execute("""
+                            UPDATE webhook_logs 
+                            SET processing_status = 'success',
+                                processing_details = 'Subscription activated',
+                                processed_at = NOW()
+                            WHERE id = %s
+                        """, (webhook_log_id,))
+                    conn.commit()
+                    logging.info(f"New subscription created for customer {subscription.customer}")
+                    
+                elif event.type == 'invoice.paid':
+                    invoice = event.data.object
+                    subscription = stripe.Subscription.retrieve(invoice.subscription)
+                    
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE webhook_logs 
+                            SET processing_status = 'success',
+                                processing_details = 'Payment confirmed and subscription extended',
+                                processed_at = NOW()
+                            WHERE id = %s
+                        """, (webhook_log_id,))
+                    conn.commit()
+                    logging.info(f"Payment confirmed for customer {invoice.customer}")
+                    
+                elif event.type == 'invoice.payment_failed':
+                    invoice = event.data.object
+                    attempt_count = invoice.attempt_count
+                    
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        # After 3 failed attempts, mark subscription as past_due
+                        new_status = 'past_due' if attempt_count >= 3 else 'active'
+                        cur.execute("""
+                            UPDATE users 
+                            SET subscription_status = %s,
+                                updated_at = NOW()
+                            WHERE stripe_customer_id = %s
+                        """, (new_status, invoice.customer))
+                        
+                        cur.execute("""
+                            UPDATE webhook_logs 
+                            SET processing_status = 'success',
+                                processing_details = %s,
+                                processed_at = NOW()
+                            WHERE id = %s
+                        """, (f"Payment failed (attempt {attempt_count})", webhook_log_id))
+                    conn.commit()
+                    
+                    # TODO: Send email notification about failed payment
+                    logging.error(f"Payment failed for customer {invoice.customer} (attempt {attempt_count})")
+                    
+                elif event.type == 'customer.subscription.deleted':
+                    subscription = event.data.object
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE users 
+                            SET subscription_status = 'inactive',
+                                subscription_id = NULL,
+                                updated_at = NOW()
+                            WHERE stripe_customer_id = %s
+                        """, (subscription.customer,))
+                        
+                        cur.execute("""
+                            UPDATE webhook_logs 
+                            SET processing_status = 'success',
+                                processing_details = 'Subscription cancelled',
+                                processed_at = NOW()
+                            WHERE id = %s
+                        """, (webhook_log_id,))
+                    conn.commit()
+                    logging.info(f"Subscription cancelled for customer {subscription.customer}")
+                
+                # If we get here, processing succeeded
+                break
+                
+            except Exception as e:
+                retry_count += 1
+                error_msg = str(e)
+                
+                try:
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE webhook_logs 
+                            SET processing_status = %s,
+                                processing_details = %s,
+                                processed_at = NOW()
+                            WHERE id = %s
+                        """, (
+                            'error' if retry_count == max_retries else 'retrying',
+                            f"Error: {error_msg} (attempt {retry_count}/{max_retries})",
+                            webhook_log_id
+                        ))
+                    conn.commit()
+                except Exception as log_error:
+                    logging.error(f"Failed to update webhook log: {str(log_error)}")
+                
+                if retry_count == max_retries:
+                    logging.error(f"Failed to process webhook after {max_retries} attempts: {error_msg}")
+                    return jsonify({'error': 'Processing failed'}), 500
+                    
+                time.sleep(2 ** retry_count)
+                continue
+        
+        return jsonify({'message': 'Webhook processed'}), 200
+        
+    except (ValueError, stripe.error.SignatureVerificationError) as e:
+        error_msg = str(e)
+        logging.error(f"Webhook verification failed: {error_msg}")
+        
+        # Log verification failure
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO webhook_logs 
+                    (event_type, processing_status, processing_details, created_at, processed_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                """, (
+                    'verification_failed',
+                    'error',
+                    f"Verification error: {error_msg}"
+                ))
+            conn.commit()
+        except Exception as log_error:
+            logging.error(f"Failed to log webhook verification error: {str(log_error)}")
+            
+        return jsonify({'error': error_msg}), 400
+
+@app.route('/get_user', methods=['POST'])
+def get_user():
+    # Check for Bearer token
+    logging.debug(f"Request headers: {request.headers}")
+    auth_header = request.headers.get('Authorization')
+    logging.debug(f"Authorization header: {auth_header}")
+
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({'error': 'No authentication token provided'}), 401
+
+    token = auth_header.split(' ')[1]
+    try:
+        # Log unverified token contents first
+        unverified = jwt.decode(token, options={"verify_signature": False})
+        logging.debug(f"Unverified token contents: {unverified}")
+        logging.debug(f"Expected issuer: https://{AUTH0_DOMAIN}/")
+        
+        # Get the signing key and verify token
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        decoded_token = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=AUTH0_ALGORITHMS,
+            audience=os.getenv('AUTH0_AUDIENCE'),
+            issuer=f'https://{AUTH0_DOMAIN}/'
+        )
+        logging.debug(f"Verified JWT token contents: {decoded_token}")
+
+        # Extract user info from token
+        auth0_id = decoded_token['sub']
+        email = decoded_token.get('email', '')
+
+        try:
+            conn = get_db_connection()
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                # Try to find existing user
+                cur.execute("""
+                    SELECT id, email, auth0_id, subscription_status
+                    FROM users 
+                    WHERE auth0_id = %s
+                """, (auth0_id,))
+                
+                user = cur.fetchone()
+                
+                if user is None:
+                    # User doesn't exist, create new user
+                    cur.execute("""
+                        INSERT INTO users 
+                        (email, auth0_id, subscription_status, created_at, updated_at)
+                        VALUES (%s, %s, 'INACTIVE', NOW(), NOW())
+                        RETURNING id, email, auth0_id, subscription_status
+                    """, (email, auth0_id))
+                    user = cur.fetchone()
+                    conn.commit()
+                    logging.info(f"Created new user with auth0_id: {auth0_id}")
+                
+                # Convert to dictionary for JSON response
+                user_data = {
+                    'id': user['id'],
+                    'email': user['email'],
+                    'auth0_id': user['auth0_id'],
+                    'subscription_status': user['subscription_status'],
+                }
+                
+                return jsonify(user_data), 200
+
+        except Exception as e:
+            logging.error(f"Database error in get_user: {str(e)}")
+            return jsonify({'error': 'Internal server error'}), 500
+
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Authentication error'}), 401
 
 if __name__ == "__main__":
     app.run(debug=True)
