@@ -54,8 +54,3 @@ CREATE TABLE users (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-## sql to add columns subscription_cancelled_at and subscription_cancelled_period_ends_at
-
-ALTER TABLE users ADD COLUMN subscription_cancelled_at TIMESTAMP WITH TIME ZONE;
-ALTER TABLE users ADD COLUMN subscription_cancelled_period_ends_at TIMESTAMP WITH TIME ZONE;
-
