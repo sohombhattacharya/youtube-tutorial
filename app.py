@@ -15,7 +15,11 @@ import uuid
 import json
 load_dotenv()
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=[
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "https://swiftnotes.ai"
+], supports_credentials=True)
 
 # Configure the Gemini API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
