@@ -728,17 +728,33 @@ def stripe_webhook():
                     
                 elif event.type == 'customer.subscription.updated':
                     subscription = event.data.object
-                    conn = get_db_connection()
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE webhook_logs 
-                            SET processing_status = 'success',
-                                processing_details = 'Subscription updated',
-                                processed_at = NOW()
-                            WHERE id = %s
-                        """, (webhook_log_id,))
+                    logging.info(f"Subscription updated: {json.dumps(subscription, indent=2)}")
+                    
+                    # Check if this is a renewal (cancel_at_period_end changed from true to false)
+                    if subscription.cancel_at_period_end == False:
+                        conn = get_db_connection()
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                UPDATE users 
+                                SET subscription_status = 'ACTIVE',
+                                    subscription_cancelled_at = NULL,
+                                    subscription_cancelled_period_ends_at = NULL,
+                                    updated_at = NOW()
+                                WHERE stripe_customer_id = %s
+                                  AND subscription_cancelled_at IS NOT NULL
+                            """, (subscription.customer,))
+                            
+                            if cur.rowcount > 0:  # If we actually updated a cancelled subscription
+                                cur.execute("""
+                                    UPDATE webhook_logs 
+                                    SET processing_status = 'success',
+                                        processing_details = 'Subscription renewed',
+                                        processed_at = NOW()
+                                    WHERE id = %s
+                                """, (webhook_log_id,))
+                                logging.info(f"Subscription renewed for customer {subscription.customer}")
+                    
                     conn.commit()
-                    logging.info(f"Subscription updated for customer {subscription.customer}")
 
                 elif event.type == 'invoice.payment_failed':
                     invoice = event.data.object
@@ -747,7 +763,7 @@ def stripe_webhook():
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         # After 3 failed attempts, mark subscription as past_due
-                        new_status = 'past_due' if attempt_count >= 3 else 'active'
+                        new_status = 'PAST_DUE' if attempt_count >= 3 else 'ACTIVE'
                         cur.execute("""
                             UPDATE users 
                             SET subscription_status = %s,
@@ -774,20 +790,18 @@ def stripe_webhook():
                         cur.execute("""
                             UPDATE users 
                             SET subscription_status = 'INACTIVE',
-                                subscription_id = NULL,
-                                updated_at = NOW()
                             WHERE stripe_customer_id = %s
                         """, (subscription.customer,))
                         
                         cur.execute("""
                             UPDATE webhook_logs 
                             SET processing_status = 'success',
-                                processing_details = 'Subscription cancelled',
+                                processing_details = 'Subscription cancelled and terminated',
                                 processed_at = NOW()
                             WHERE id = %s
                         """, (webhook_log_id,))
                     conn.commit()
-                    logging.info(f"Subscription cancelled for customer {subscription.customer}")
+                    logging.info(f"Subscription terminated for customer {subscription.customer}")
                 
                 # If we get here, processing succeeded
                 break
@@ -1022,6 +1036,58 @@ def cancel_subscription():
 
     except Exception as e:
         logging.error(f"Unexpected error in cancel_subscription: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/manage_sub', methods=['POST'])
+def manage_subscription():
+    # Check for Bearer token
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({'error': 'No authentication token provided'}), 401
+
+    token = auth_header.split(' ')[1]
+    try:
+        # Verify token and get user info
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        decoded_token = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=AUTH0_ALGORITHMS,
+            audience=os.getenv('AUTH0_AUDIENCE'),
+            issuer=f'https://{AUTH0_DOMAIN}/'
+        )
+
+        auth0_id = decoded_token['sub']
+
+        # Get user's Stripe customer ID from database
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("""
+                SELECT stripe_customer_id
+                FROM users 
+                WHERE auth0_id = %s
+            """, (auth0_id,))
+            user = cur.fetchone()
+
+            if not user or not user['stripe_customer_id']:
+                return jsonify({'error': 'No Stripe customer found'}), 404
+            
+            try:
+                # Create Stripe billing portal session
+                session = stripe.billing_portal.Session.create(
+                    customer=user['stripe_customer_id'],
+                )
+                return jsonify({'url': session.url}), 200
+
+            except stripe.error.StripeError as e:
+                logging.error(f"Stripe error creating portal session: {str(e)}")
+                return jsonify({'error': 'Failed to create management session'}), 500
+
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in manage_subscription: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == "__main__":
