@@ -726,6 +726,20 @@ def stripe_webhook():
                     conn.commit()
                     logging.info(f"Payment confirmed for customer {invoice.customer}")
                     
+                elif event.type == 'customer.subscription.updated':
+                    subscription = event.data.object
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE webhook_logs 
+                            SET processing_status = 'success',
+                                processing_details = 'Subscription updated',
+                                processed_at = NOW()
+                            WHERE id = %s
+                        """, (webhook_log_id,))
+                    conn.commit()
+                    logging.info(f"Subscription updated for customer {subscription.customer}")
+
                 elif event.type == 'invoice.payment_failed':
                     invoice = event.data.object
                     attempt_count = invoice.attempt_count
