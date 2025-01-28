@@ -78,6 +78,7 @@ def get_db_connection():
         g._database = app.db_pool.getconn()
     return g._database
 
+
 # Configure the Gemini API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
