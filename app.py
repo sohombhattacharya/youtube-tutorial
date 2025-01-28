@@ -50,7 +50,8 @@ app = Flask(__name__)
 CORS(app, origins=[
     "http://localhost:8080",
     "http://127.0.0.1:8080",
-    "https://swiftnotes.ai"
+    "https://swiftnotes.ai",
+    "https://deploy-preview-1--swiftnotesai.netlify.app"
 ], supports_credentials=True)
 
 # Initialize the connection pool
@@ -244,7 +245,7 @@ def generate_tutorial_endpoint():
             )
 
             auth0_id = decoded_token['sub']
-            
+
             conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute(
