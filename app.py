@@ -33,13 +33,14 @@ import time  # Import time for generating unique filenames
 import uuid
 import json
 import jwt
-from jwt import PyJWKClient  # Add this import
+from authlib.oauth2.rfc7523 import JWTBearerTokenValidator
+from authlib.jose.rfc7517.jwk import JsonWebKey
 from psycopg2 import pool
 import psycopg2.extras
 import atexit
 import ssl
 import certifi
-
+import requests
 load_dotenv()
 app = Flask(__name__)
 CORS(app, origins=[
@@ -79,6 +80,8 @@ def get_db_connection():
     return g._database
 
 
+
+
 # Configure the Gemini API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -88,22 +91,31 @@ if not AUTH0_DOMAIN:
     logging.error("AUTH0_DOMAIN environment variable is not set!")
     raise ValueError("AUTH0_DOMAIN must be configured")
 
-AUTH0_ALGORITHMS = ['RS256']
-jwks_url = f'https://{AUTH0_DOMAIN}/.well-known/jwks.json'
-logging.info(f"Auth0 Domain: {AUTH0_DOMAIN}")
-logging.info(f"JWKS URL: {jwks_url}")
+# Replace JWKS client setup with Auth0 validator
+class Auth0JWTBearerTokenValidator(JWTBearerTokenValidator):
+    def __init__(self, domain, audience):
+        issuer = f'https://{domain}/'
+        jsonurl = requests.get(f'{issuer}.well-known/jwks.json')
+        public_key = JsonWebKey.import_key_set(jsonurl.json())
+        super().__init__(public_key, issuer=issuer, audience=audience)
 
 try:
-    # Create JWKS client with SSL context
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
-    jwks_client = PyJWKClient(jwks_url, ssl_context=ssl_context)
-    logging.info("Successfully initialized JWKS client")
+    auth0_validator = Auth0JWTBearerTokenValidator(
+        AUTH0_DOMAIN,
+        os.getenv('AUTH0_AUDIENCE')
+    )
+    logging.info("Successfully initialized Auth0 validator")
 except Exception as e:
-    logging.error(f"Failed to initialize JWKS client: {type(e).__name__}: {str(e)}")
+    logging.error(f"Failed to initialize Auth0 validator: {str(e)}")
     raise
 
-def validate_token(token):
-    return token == os.getenv("API_KEY")
+def verify_token(token):
+    try:
+        claims = auth0_validator.validate_token(token)
+        return claims
+    except Exception as e:
+        logging.error(f"Token validation failed: {str(e)}")
+        raise
 
 def generate_tutorial(transcript_data, youtube_url):
     # Create a detailed prompt for the Gemini model
@@ -893,18 +905,8 @@ def get_user():
 
     token = auth_header.split(' ')[1]
     try:
-        # Get the signing key and verify token
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
-        decoded_token = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=AUTH0_ALGORITHMS,
-            audience=os.getenv('AUTH0_AUDIENCE'),
-            issuer=f'https://{AUTH0_DOMAIN}/'
-        )
-
-        # Extract user info from token
-        auth0_id = decoded_token['sub']
+        claims = verify_token(token)
+        auth0_id = claims['sub']
 
         try:
             conn = get_db_connection()
