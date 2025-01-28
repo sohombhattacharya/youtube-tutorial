@@ -57,8 +57,9 @@ CREATE TABLE users (
 CREATE TABLE user_notes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id),  
+    title TEXT NOT NULL,
     youtube_video_url TEXT NOT NULL, 
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, youtube_video_url)
+    UNIQUE(user_id, youtube_video_url)
 );
 
