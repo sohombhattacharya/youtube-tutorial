@@ -648,16 +648,17 @@ def get_visitor_notes():
 
 # Add Stripe configuration after other configurations
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
-endpoint_secret = os.getenv('STRIPE_WEBHOOK_SECRET')
+stripe_endpoint_secret = os.getenv('STRIPE_WEBHOOK_SECRET')
 
 @app.route('/webhook/stripe', methods=['POST'])
 def stripe_webhook():
     payload = request.data.decode("utf-8")
     signature = request.headers.get('Stripe-Signature')
-
+    webhook_log_id = None  
+    
     try:
         # Verify Stripe signature
-        event = stripe.Webhook.construct_event(payload, signature, endpoint_secret)
+        event = stripe.Webhook.construct_event(payload, signature, stripe_endpoint_secret)
         
         # Extract customer ID from the event
         customer_id = event.data.object.customer
@@ -677,7 +678,7 @@ def stripe_webhook():
                 customer_id
             ))
             webhook_log_id = cur.fetchone()[0]
-            conn.commit()
+        conn.commit()
         
         # Process the event with retries
         max_retries = 3
@@ -728,10 +729,9 @@ def stripe_webhook():
                     
                 elif event.type == 'customer.subscription.updated':
                     subscription = event.data.object
-                    logging.info(f"Subscription updated: {json.dumps(subscription, indent=2)}")
                     
-                    # Check if this is a renewal (cancel_at_period_end changed from true to false)
                     if subscription.cancel_at_period_end == False:
+                        # Handle subscription renewal (existing code)
                         conn = get_db_connection()
                         with conn.cursor() as cur:
                             cur.execute("""
@@ -744,7 +744,7 @@ def stripe_webhook():
                                   AND subscription_cancelled_at IS NOT NULL
                             """, (subscription.customer,))
                             
-                            if cur.rowcount > 0:  # If we actually updated a cancelled subscription
+                            if cur.rowcount > 0:
                                 cur.execute("""
                                     UPDATE webhook_logs 
                                     SET processing_status = 'success',
@@ -753,6 +753,27 @@ def stripe_webhook():
                                     WHERE id = %s
                                 """, (webhook_log_id,))
                                 logging.info(f"Subscription renewed for customer {subscription.customer}")
+                    
+                    elif subscription.cancel_at_period_end == True:
+                        # Handle subscription cancellation
+                        conn = get_db_connection()
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                UPDATE users 
+                                SET subscription_cancelled_at = NOW(),
+                                    subscription_cancelled_period_ends_at = to_timestamp(%s),
+                                    updated_at = NOW()
+                                WHERE stripe_customer_id = %s
+                            """, (subscription.current_period_end, subscription.customer))
+                            
+                            cur.execute("""
+                                UPDATE webhook_logs 
+                                SET processing_status = 'success',
+                                    processing_details = 'Subscription cancelled (will end at period end)',
+                                    processed_at = NOW()
+                                WHERE id = %s
+                            """, (webhook_log_id,))
+                            logging.info(f"Subscription cancelled (pending end of period) for customer {subscription.customer}")
                     
                     conn.commit()
 
@@ -763,7 +784,7 @@ def stripe_webhook():
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         # After 3 failed attempts, mark subscription as past_due
-                        new_status = 'PAST_DUE' if attempt_count >= 3 else 'ACTIVE'
+                        new_status = 'INACTIVE' if attempt_count >= 3 else 'ACTIVE'
                         cur.execute("""
                             UPDATE users 
                             SET subscription_status = %s,
