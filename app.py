@@ -32,7 +32,6 @@ from botocore.exceptions import NoCredentialsError
 import time  # Import time for generating unique filenames
 import uuid
 import json
-import jwt
 from authlib.oauth2.rfc7523 import JWTBearerTokenValidator
 from authlib.jose.rfc7517.jwk import JsonWebKey
 from psycopg2 import pool
@@ -41,6 +40,11 @@ import atexit
 import ssl
 import certifi
 import requests
+from authlib.integrations.flask_oauth2 import ResourceProtector
+from authlib.jose import jwt  # Add this import at the top
+
+
+
 load_dotenv()
 app = Flask(__name__)
 CORS(app, origins=[
@@ -94,28 +98,28 @@ if not AUTH0_DOMAIN:
 # Replace JWKS client setup with Auth0 validator
 class Auth0JWTBearerTokenValidator(JWTBearerTokenValidator):
     def __init__(self, domain, audience):
+        logging.info(f"Initializing Auth0JWTBearerTokenValidator with domain: {domain} and audience: {audience}")
         issuer = f'https://{domain}/'
         jsonurl = requests.get(f'{issuer}.well-known/jwks.json')
         public_key = JsonWebKey.import_key_set(jsonurl.json())
         super().__init__(public_key, issuer=issuer, audience=audience)
+        logging.info(f"Auth0JWTBearerTokenValidator initialized with domain: {domain} and audience: {audience}")
+        self.claims_options = {
+            "exp": {"essential": True},
+            "aud": {"essential": True, "value": audience},
+            "iss": {"essential": True, "value": issuer},
+            "sub": {"essential": True}
+        }
 
-try:
-    auth0_validator = Auth0JWTBearerTokenValidator(
-        AUTH0_DOMAIN,
-        os.getenv('AUTH0_AUDIENCE')
-    )
-    logging.info("Successfully initialized Auth0 validator")
-except Exception as e:
-    logging.error(f"Failed to initialize Auth0 validator: {str(e)}")
-    raise
+# Initialize the Auth0 validator
+auth0_validator = Auth0JWTBearerTokenValidator(
+    AUTH0_DOMAIN,
+    os.getenv('AUTH0_AUDIENCE')
+)
 
-def verify_token(token):
-    try:
-        claims = auth0_validator.validate_token(token)
-        return claims
-    except Exception as e:
-        logging.error(f"Token validation failed: {str(e)}")
-        raise
+# Create ResourceProtector for route protection
+require_auth = ResourceProtector()
+require_auth.register_token_validator(auth0_validator)
 
 def generate_tutorial(transcript_data, youtube_url):
     # Create a detailed prompt for the Gemini model
@@ -230,18 +234,17 @@ def generate_tutorial_endpoint():
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
         try:
-            # Verify token and get user's subscription status
-            signing_key = jwks_client.get_signing_key_from_jwt(token)
             decoded_token = jwt.decode(
-                token,
-                signing_key.key,
-                algorithms=AUTH0_ALGORITHMS,
-                audience=os.getenv('AUTH0_AUDIENCE'),
-                issuer=f'https://{AUTH0_DOMAIN}/'
+            token,
+            auth0_validator.public_key,  # Use the public key from your validator
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
             )
-            
-            # Get user's subscription status from database
+
             auth0_id = decoded_token['sub']
+            
             conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute(
@@ -418,18 +421,18 @@ def get_tutorial():
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
         try:
-            # Verify token and get user's subscription status
-            signing_key = jwks_client.get_signing_key_from_jwt(token)
             decoded_token = jwt.decode(
-                token,
-                signing_key.key,
-                algorithms=AUTH0_ALGORITHMS,
-                audience=os.getenv('AUTH0_AUDIENCE'),
-                issuer=f'https://{AUTH0_DOMAIN}/'
+            token,
+            auth0_validator.public_key,  # Use the public key from your validator
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
             )
+
+            auth0_id = decoded_token['sub']
             
             # Get user's subscription status from database
-            auth0_id = decoded_token['sub']
             conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute(
@@ -454,7 +457,7 @@ def get_tutorial():
     video_id = video_id_match.group(1)
 
     # Check note access only if user is not ACTIVE
-    if subscription_status != 'ACTIVE':
+    if subscription_status != 'ACTIVE' and visitor_id:
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -496,7 +499,7 @@ def get_tutorial():
         tutorial = s3_response['Body'].read().decode('utf-8')
 
         # Record the view only if user is not ACTIVE
-        if subscription_status != 'ACTIVE':
+        if subscription_status != 'ACTIVE' and visitor_id:
             try:
                 conn = get_db_connection()
                 with conn.cursor() as cur:
@@ -895,65 +898,60 @@ def stripe_webhook():
         return jsonify({'error': error_msg}), 400
 
 @app.route('/get_user', methods=['GET'])
+@require_auth(None)
 def get_user():
-    # Check for Bearer token
-    auth_header = request.headers.get('Authorization')
+    # Get the token from the Authorization header
+    token = request.headers.get('Authorization').split(' ')[1]
+    
+    # Decode the JWT token with verification
+    decoded = jwt.decode(
+        token,
+        auth0_validator.public_key,  # Use the public key from your validator
+        claims_options={
+            "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+            "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+        }
+    )
+    auth0_id = decoded['sub']  # Get the Auth0 user ID from the decoded token
     email = request.args.get('email')
 
-    if not auth_header or not auth_header.startswith('Bearer '):
-        return jsonify({'error': 'No authentication token provided'}), 401
-
-    token = auth_header.split(' ')[1]
     try:
-        claims = verify_token(token)
-        auth0_id = claims['sub']
-
-        try:
-            conn = get_db_connection()
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Try to find existing user
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Try to find existing user
+            cur.execute("""
+                SELECT id, email, auth0_id, subscription_status, subscription_cancelled_period_ends_at
+                FROM users 
+                WHERE auth0_id = %s
+            """, (auth0_id,))
+            
+            user = cur.fetchone()
+            
+            if user is None:
+                # User doesn't exist, create new user
                 cur.execute("""
-                    SELECT id, email, auth0_id, subscription_status, subscription_cancelled_period_ends_at
-                    FROM users 
-                    WHERE auth0_id = %s
-                """, (auth0_id,))
-                
+                    INSERT INTO users 
+                    (email, auth0_id, subscription_status, created_at, updated_at)
+                    VALUES (%s, %s, 'INACTIVE', NOW(), NOW())
+                    RETURNING id, email, auth0_id, subscription_status, subscription_cancelled_period_ends_at
+                """, (email, auth0_id))
                 user = cur.fetchone()
-                
-                if user is None:
-                    # User doesn't exist, create new user
-                    cur.execute("""
-                        INSERT INTO users 
-                        (email, auth0_id, subscription_status, created_at, updated_at)
-                        VALUES (%s, %s, 'INACTIVE', NOW(), NOW())
-                        RETURNING id, email, auth0_id, subscription_status, subscription_cancelled_period_ends_at
-                    """, (email, auth0_id))
-                    user = cur.fetchone()
-                    conn.commit()
-                    logging.info(f"Created new user with auth0_id: {auth0_id}")
-                
-                logging.debug(f"User data: {user['subscription_cancelled_period_ends_at']}")
+                conn.commit()
+                logging.info(f"Created new user with auth0_id: {auth0_id}")
+            
+            # Convert to dictionary for JSON response
+            user_data = {
+                'id': user['id'],
+                'email': user['email'],
+                'auth0_id': user['auth0_id'],
+                'subscription_status': user['subscription_status'],
+                'subscription_ends_at': user['subscription_cancelled_period_ends_at'].isoformat() if user['subscription_cancelled_period_ends_at'] else None,
+            }
+            return jsonify(user_data), 200
 
-                # Convert to dictionary for JSON response
-                user_data = {
-                    'id': user['id'],
-                    'email': user['email'],
-                    'auth0_id': user['auth0_id'],
-                    'subscription_status': user['subscription_status'],
-                    'subscription_ends_at': user['subscription_cancelled_period_ends_at'].isoformat() if user['subscription_cancelled_period_ends_at'] else None,
-                }
-                return jsonify(user_data), 200
-
-        except Exception as e:
-            logging.error(f"Database error in get_user: {str(e)}")
-            return jsonify({'error': 'Internal server error'}), 500
-
-    except jwt.InvalidTokenError as e:
-        logging.error(f"Invalid JWT token: {str(e)}")
-        return jsonify({'error': 'Invalid authentication token'}), 401
     except Exception as e:
-        logging.error(f"Error decoding token: {type(e).__name__}: {str(e)}")
-        return jsonify({'error': 'Authentication error'}), 401
+        logging.error(f"Database error in get_user: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/cancel_subscription', methods=['POST'])
 def cancel_subscription():
@@ -981,25 +979,18 @@ def cancel_subscription():
     try:
         # Verify token and get user info
         def verify_token():
-            signing_key = jwks_client.get_signing_key_from_jwt(token)
-            return jwt.decode(
-                token,
-                signing_key.key,
-                algorithms=AUTH0_ALGORITHMS,
-                audience=os.getenv('AUTH0_AUDIENCE'),
-                issuer=f'https://{AUTH0_DOMAIN}/'
-            )
+            claims = auth0_validator.validate_token(token, scopes=None, request=None)
+            auth0_id = claims['sub']
+            return auth0_id
 
         try:
-            decoded_token = retry_operation(verify_token)
+            auth0_id = retry_operation(verify_token)
         except jwt.InvalidTokenError as e:
             logging.error(f"Invalid JWT token: {str(e)}")
             return jsonify({'error': 'Invalid authentication token'}), 401
         except Exception as e:
             logging.error(f"Error verifying token: {type(e).__name__}: {str(e)}")
             return jsonify({'error': 'Authentication error'}), 401
-
-        auth0_id = decoded_token['sub']
 
         # Get user's subscription info from database
         def get_user_subscription():
@@ -1071,14 +1062,13 @@ def manage_subscription():
 
     token = auth_header.split(' ')[1]
     try:
-        # Verify token and get user info
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
         decoded_token = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=AUTH0_ALGORITHMS,
-            audience=os.getenv('AUTH0_AUDIENCE'),
-            issuer=f'https://{AUTH0_DOMAIN}/'
+        token,
+        auth0_validator.public_key,  # Use the public key from your validator
+        claims_options={
+            "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+            "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
         )
 
         auth0_id = decoded_token['sub']
