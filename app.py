@@ -1105,5 +1105,139 @@ def manage_subscription():
         logging.error(f"Error in manage_subscription: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
+@app.route('/save_note', methods=['POST'])
+@require_auth(None)  # Use the existing auth decorator
+def save_note():
+    try:
+        # Get token from Authorization header and decode it
+        token = request.headers.get('Authorization').split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+
+        # Get video URL from request
+        data = request.json
+        youtube_url = data.get('url')
+        if not youtube_url:
+            return jsonify({'error': 'YouTube URL is required'}), 400
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Check user's subscription status and get user_id
+            cur.execute("""
+                SELECT id, subscription_status 
+                FROM users 
+                WHERE auth0_id = %s
+            """, (auth0_id,))
+            
+            user = cur.fetchone()
+            if not user:
+                return jsonify({'error': 'User not found'}), 404
+            
+            if user['subscription_status'] != 'ACTIVE':
+                return jsonify({
+                    'error': 'Subscription required',
+                    'message': 'An active subscription is required to save notes'
+                }), 403
+
+            # Try to insert the note
+            try:
+                cur.execute("""
+                    INSERT INTO user_notes (user_id, youtube_video_url)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id, youtube_video_url) DO NOTHING
+                    RETURNING created_at
+                """, (user['id'], youtube_url))
+                conn.commit()
+                
+                result = cur.fetchone()
+                if result:
+                    return jsonify({
+                        'message': 'Note saved successfully',
+                        'created_at': result['created_at'].isoformat()
+                    }), 201
+                else:
+                    return jsonify({
+                        'message': 'Note was already saved',
+                    }), 200
+
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Database error saving note: {str(e)}")
+                return jsonify({'error': 'Failed to save note'}), 500
+
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in save_note: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/is_saved', methods=['POST'])
+@require_auth(None)  # Use the existing auth decorator
+def is_saved():
+    try:
+        # Get token from Authorization header and decode it
+        token = request.headers.get('Authorization').split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+
+        # Get video URL from request
+        data = request.json
+        youtube_url = data.get('url')
+        if not youtube_url:
+            return jsonify({'error': 'YouTube URL is required'}), 400
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Check user's subscription status and if note is saved
+            cur.execute(
+                """
+                SELECT u.subscription_status, 
+                       EXISTS(
+                           SELECT 1 
+                           FROM user_notes un 
+                           WHERE un.user_id = u.id 
+                           AND un.youtube_video_url = %s
+                       ) as note_saved
+                FROM users u 
+                WHERE u.auth0_id = %s
+                """,
+                (youtube_url, auth0_id)
+            )
+            
+            result = cur.fetchone()
+            if not result:
+                return jsonify({'error': 'User not found'}), 404
+            
+            subscription_status, is_saved = result
+            
+            # Only return saved status if user has active subscription
+            saved_status = is_saved if subscription_status == 'ACTIVE' else False
+            
+            return jsonify({
+                'saved': saved_status
+            }), 200
+
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in is_saved: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
 if __name__ == "__main__":
     app.run(debug=True)
