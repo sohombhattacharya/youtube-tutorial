@@ -1356,27 +1356,32 @@ def generate_tldr(transcript_data, youtube_url):
     prompt = (
         "# TLDR Generation from YouTube Transcript\n\n"
         "## Objective\n"
-        "Create a concise, clear TLDR (Too Long; Didn't Read) summary based on a provided YouTube transcript. "
+        "Create a highly informative, concise, clear TLDR (Too Long; Didn't Read) summary based on a provided YouTube transcript. "
         "The transcript can be of various lengths. Please do not ignore any information in the transcript. For example, if the transcript is longer than 1 hour, then you should gather information from the entire transcript and write up a TLDR of the entire video."
         "The YouTube transcript is split into a list of dictionaries, each containing text and start time."
         "For example: {'text': 'Hello, my name is John', 'start': 100}. This means that the text 'Hello, my name is John' starts at 100 seconds into the video.\n\n"        
         "The summary should be brief but capture all important points from the entire transcript. Do not ignore any information in the transcript. Each bullet point should be unique from the other bullet points. For example, do not have bullet points that are close in time to each other. \n\n"
         "## Instructions\n"
         "1. **Format**:\n"
-        "   - Start with a one-sentence overview of what the video is about.\n"
-        "   - Follow with 3-5 key bullet points that capture the main takeaways.\n"
-        "   - Each bullet point should be clear and concise (1-2 sentences max).\n\n"
+        "   - Start with a title of what the video is about.\n"
+        "   - Then follow up with a one-sentence overview of what the video is about.\n"
+        "   - Follow with at least 3-5 key bullet points that capture the main takeaways. If you find that the video is too short, then you can reduce the number of bullet points to 3. If you find that the video has more than 5 key takeways include them all.\n"
+        "   - Each bullet point should be clear and concise (1-2 sentences max). \n\n"
+        "   - Each bullet point should start with the topic in bold. \n\n"
+        "   - Each bullet point must be unique and should not overlap with the other bullets, even if the topics are discussed at different parts of the video. For example, if a topic is discussed repeatedly, only one bullet point should mention the overall point about the topic, and not each of the times it was mentioned in the video. Aim to use information from the whole video.\n\n"
+        "   - Pay special attention to information that seems to be emphasized by the speaker or returned to multiple times.\n\n"
+        "   - Interpret the meaning and significance of each point. Don't just summarize what was said, but also what impact it has on the overall message.\n\n"
+        "   - At the end include a 1-2 sentence conclusion that summarizes the main takeaways and what the video is about.\n\n"
         "2. **Time Stamps**:\n"
         "   - Each bullet point should also point out the start time of the section in the transcript. Include the start time in the section heading end as an integer in a specific format. For example: '[sec:100]'\n\n"        
         "3. **Length**:\n"
         "   - The entire TLDR should be no more than 200 words.\n"
-        "   - Focus on the most important information only.\n\n"
         f"## Transcript\n{transcript_data}\n\n"
         "## Output Format\n"
         "The output should be in markdown format with a brief overview followed by bullet points.\n\n"
         "Transcript:"
     )
-    
+
     model = genai.GenerativeModel("gemini-1.5-flash")
     response = model.generate_content(prompt)
     
