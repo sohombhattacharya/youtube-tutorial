@@ -415,6 +415,7 @@ def get_tutorial():
     data = request.json
     video_url = data.get('url')
     visitor_id = data.get('visitor_id')  # This will always be present
+    is_tldr = data.get('tldr', False)  # New flag to determine if we want TLDR
     
     subscription_status = 'INACTIVE'  # Default status
     
@@ -424,7 +425,7 @@ def get_tutorial():
         try:
             decoded_token = jwt.decode(
             token,
-            auth0_validator.public_key,  # Use the public key from your validator
+            auth0_validator.public_key,
             claims_options={
                 "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
                 "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
@@ -448,7 +449,7 @@ def get_tutorial():
             logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
             # Continue execution with default INACTIVE status
     
-    logging.info(f"Received request at /get_tutorial with video_url: {video_url}")
+    logging.info(f"Received request at /get_tutorial with video_url: {video_url}, tldr: {is_tldr}")
         
     # Extract video ID from the URL
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
@@ -492,12 +493,13 @@ def get_tutorial():
     )
     
     bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
-    s3_key = f"notes/{video_id}"
+    # Use different S3 key based on whether we want TLDR or regular notes
+    s3_key = f"tldr/{video_id}" if is_tldr else f"notes/{video_id}"
     
     try:
-        # Check if the markdown exists in S3
+        # Check if the content exists in S3
         s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
-        tutorial = s3_response['Body'].read().decode('utf-8')
+        content = s3_response['Body'].read().decode('utf-8')
 
         # Record the view only if user is not ACTIVE
         if subscription_status != 'ACTIVE' and visitor_id:
@@ -517,9 +519,9 @@ def get_tutorial():
                 logging.error(f"Error recording visitor note: {str(e)}")
                 # Continue execution even if this fails
 
-        return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except s3_client.exceptions.NoSuchKey:
-        return jsonify({'error': 'Tutorial not found'}), 404
+        return jsonify({'error': 'Content not found'}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1348,6 +1350,223 @@ def get_saved_notes():
     except Exception as e:
         logging.error(f"Error in get_saved_notes: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
+
+def generate_tldr(transcript_data, youtube_url):
+    # Create a detailed prompt for the Gemini model
+    prompt = (
+        "# TLDR Generation from YouTube Transcript\n\n"
+        "## Objective\n"
+        "Create a concise, clear TLDR (Too Long; Didn't Read) summary based on a provided YouTube transcript. "
+        "The transcript can be of various lengths. Please do not ignore any information in the transcript. For example, if the transcript is longer than 1 hour, then you should gather information from the entire transcript and write up a TLDR of the entire video."
+        "The YouTube transcript is split into a list of dictionaries, each containing text and start time."
+        "For example: {'text': 'Hello, my name is John', 'start': 100}. This means that the text 'Hello, my name is John' starts at 100 seconds into the video.\n\n"        
+        "The summary should be brief but capture all important points from the entire transcript. Do not ignore any information in the transcript. Each bullet point should be unique from the other bullet points. For example, do not have bullet points that are close in time to each other. \n\n"
+        "## Instructions\n"
+        "1. **Format**:\n"
+        "   - Start with a one-sentence overview of what the video is about.\n"
+        "   - Follow with 3-5 key bullet points that capture the main takeaways.\n"
+        "   - Each bullet point should be clear and concise (1-2 sentences max).\n\n"
+        "2. **Time Stamps**:\n"
+        "   - Each bullet point should also point out the start time of the section in the transcript. Include the start time in the section heading end as an integer in a specific format. For example: '[sec:100]'\n\n"        
+        "3. **Length**:\n"
+        "   - The entire TLDR should be no more than 200 words.\n"
+        "   - Focus on the most important information only.\n\n"
+        f"## Transcript\n{transcript_data}\n\n"
+        "## Output Format\n"
+        "The output should be in markdown format with a brief overview followed by bullet points.\n\n"
+        "Transcript:"
+    )
+    
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(prompt)
+    
+    # Log the title of the TLDR only if there is a response
+    if response:
+        title = response.text[:75]  
+        logging.info(f"TLDR generated for {youtube_url}, {title}")
+
+        # Replace [sec:XX] with hyperlinks
+        video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', youtube_url)
+        if video_id_match:
+            video_id = video_id_match.group(1)
+            markdown_text = response.text
+            
+            # Function to replace [sec:XX] with markdown hyperlinks
+            def replace_sec_links(match):
+                seconds = int(match.group(1))
+                
+                if seconds >= 3600:
+                    hours = seconds // 3600
+                    minutes = (seconds % 3600) // 60
+                    remaining_seconds = seconds % 60
+                    display_time = f"{hours}hr{minutes}m{remaining_seconds}s"
+                elif seconds >= 60:
+                    minutes = seconds // 60
+                    remaining_seconds = seconds % 60
+                    display_time = f"{minutes}m{remaining_seconds}s"
+                else:
+                    display_time = f"{seconds}s"
+                
+                return f'[{display_time}](https://youtu.be/{video_id}?t={seconds})'
+            
+            markdown_text = re.sub(r'\[sec:(\d+)\]', replace_sec_links, markdown_text)
+            return markdown_text
+    else:
+        return 'No TLDR generated.'
+
+@app.route('/generate_tldr', methods=['POST'])
+def generate_tldr_endpoint():
+    # Check for Bearer token
+    logging.debug(f"Request headers: {request.headers}")
+    auth_header = request.headers.get('Authorization')
+    logging.debug(f"Authorization header: {auth_header}")
+    visitor_id = request.json.get('visitor_id')
+
+    subscription_status = 'INACTIVE'  # Default status
+    
+    # Process Bearer token if present
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        try:
+            decoded_token = jwt.decode(
+                token,
+                auth0_validator.public_key,
+                claims_options={
+                    "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                    "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
+            )
+
+            auth0_id = decoded_token['sub']
+
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT subscription_status FROM users WHERE auth0_id = %s",
+                    (auth0_id,)
+                )
+                result = cur.fetchone()
+                if result:
+                    subscription_status = result[0]
+                    
+        except Exception as e:
+            logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
+            # Continue execution with default INACTIVE status
+
+    data = request.json
+    video_url = data.get('url')
+    logging.info(f"Received request at /generate_tldr with video_url: {video_url}")
+        
+    # Extract video ID from the URL
+    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
+    if not video_id_match:
+        return jsonify({'error': 'Invalid YouTube URL'}), 400
+    
+    video_id = video_id_match.group(1)
+
+    # Check note access only if user is not ACTIVE
+    if subscription_status != 'ACTIVE' and visitor_id:
+        try:
+            conn = get_db_connection()
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM visitor_notes WHERE visitor_id = %s AND youtube_video_id = %s)",
+                    (visitor_id, video_id)
+                )
+                has_viewed = cur.fetchone()[0]
+                
+                if not has_viewed:
+                    cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
+                    note_count = cur.fetchone()[0]
+                    
+                    if note_count >= 7:
+                        return jsonify({
+                            'error': 'Free note limit reached',
+                            'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
+                        }), 403
+
+        except Exception as e:
+            logging.error(f"Database error checking visitor notes: {str(e)}")
+            return jsonify({'error': 'Internal server error'}), 500
+
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+    )
+    
+    bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+    s3_key = f"tldr/{video_id}"  # Different path for TLDRs
+    
+    try:
+        try:
+            s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+            tldr = s3_response['Body'].read().decode('utf-8')
+
+            if subscription_status != 'ACTIVE' and visitor_id:
+                try:
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
+                            VALUES (%s, %s) 
+                            ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                            """,
+                            (visitor_id, video_id)
+                        )
+                    conn.commit()
+                except Exception as e:
+                    logging.error(f"Error handling visitor note: {str(e)}")
+                    pass
+
+            return tldr, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        except s3_client.exceptions.NoSuchKey:
+            # Determine if running locally using the environment variable
+            is_local = os.getenv('APP_ENV') == 'development'
+
+            # Set proxies only if not running locally
+            proxies = None if is_local else {
+                'http': "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001",
+                'https': "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
+            }
+            
+            transcript_data = YouTubeTranscriptApi.get_transcript(video_id, proxies=proxies, languages=["en", "es", "fr", "de", "it", "pt", "ru", "zh", "hi", "uk", "cs", "sv"])
+
+            for entry in transcript_data:
+                entry.pop('duration', None)
+                if 'start' in entry:
+                    entry['start'] = int(entry['start'])
+            
+            tldr = generate_tldr(transcript_data, video_url)
+            
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=tldr,
+                ContentType='text/plain'
+            )
+            
+            if subscription_status != 'ACTIVE' and visitor_id:
+                try:
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
+                            VALUES (%s, %s) 
+                            ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                            """,
+                            (visitor_id, video_id)
+                        )
+                    conn.commit()
+                except Exception as e:
+                    logging.error(f"Error handling visitor note: {str(e)}")
+                    pass
+
+            return tldr, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
