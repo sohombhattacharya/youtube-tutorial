@@ -306,7 +306,7 @@ def generate_tutorial_endpoint():
                     cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
                     note_count = cur.fetchone()[0]
                     
-                    if note_count >= 7:
+                    if note_count >= 3:
                         return jsonify({
                             'error': 'Free note limit reached',
                             'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
@@ -492,7 +492,7 @@ def get_tutorial():
                     cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
                     note_count = cur.fetchone()[0]
                     
-                    if note_count >= 7:
+                    if note_count >= 3:
                         return jsonify({
                             'error': 'Free note limit reached',
                             'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
@@ -675,7 +675,7 @@ def get_visitor_notes():
             
             return jsonify({
                 'used_notes': used_notes,
-                'total_free_notes': 7
+                'total_free_notes': 3
             }), 200
 
     except Exception as e:
@@ -1501,7 +1501,7 @@ def generate_tldr_endpoint():
                     cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
                     note_count = cur.fetchone()[0]
                     
-                    if note_count >= 7:
+                    if note_count >= 3:
                         return jsonify({
                             'error': 'Free note limit reached',
                             'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
