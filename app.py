@@ -6,6 +6,16 @@ import stripe  # Add this import at the top with other imports
 # Configure logging - must be first!
 log_level = logging.DEBUG if os.getenv('APP_ENV') == 'development' else logging.INFO
 
+# Custom filter to exclude OPTIONS and POST requests
+class HTTPFilter(logging.Filter):
+    def filter(self, record):
+        # Check if this is a Werkzeug access log
+        if 'werkzeug' in record.name.lower():
+            # Filter out OPTIONS and POST requests
+            return not ('OPTIONS' in record.getMessage() or 'POST' in record.getMessage() or 'GET' in record.getMessage())
+        return True
+
+# Configure logging
 logging.basicConfig(
     level=log_level,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -14,6 +24,11 @@ logging.basicConfig(
     ],
     force=True  # Force override any existing configuration
 )
+
+# Add filter to both Werkzeug logger and root logger
+werkzeug_logger = logging.getLogger('werkzeug')
+werkzeug_logger.addFilter(HTTPFilter())
+logging.getLogger().addFilter(HTTPFilter())
 
 logging.info("=== Application Starting ===")
 logging.debug("Debug logging enabled - running in development mode")
