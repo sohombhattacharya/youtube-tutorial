@@ -11,8 +11,7 @@ class HTTPFilter(logging.Filter):
     def filter(self, record):
         # Check if this is a Werkzeug access log
         if 'werkzeug' in record.name.lower():
-            # Filter out OPTIONS and POST requests
-            return not ('OPTIONS' in record.getMessage() or 'POST' in record.getMessage() or 'GET' in record.getMessage())
+            return False  # Filter out all Werkzeug logs
         return True
 
 # Configure logging
@@ -29,6 +28,9 @@ logging.basicConfig(
 werkzeug_logger = logging.getLogger('werkzeug')
 werkzeug_logger.addFilter(HTTPFilter())
 logging.getLogger().addFilter(HTTPFilter())
+
+# Also set Werkzeug logger level to ERROR to suppress most messages
+werkzeug_logger.setLevel(logging.ERROR)
 
 logging.info("=== Application Starting ===")
 logging.debug("Debug logging enabled - running in development mode")
