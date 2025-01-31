@@ -403,19 +403,6 @@ def convert_html_to_pdf():
     if not html_content:
         return jsonify({'error': 'HTML content is required'}), 400
     
-    # If generating snippets, remove all timestamp references and hyperlinks
-    if get_snippet_zip:
-        # Remove timestamp hyperlinks first (any <a> tag containing a timestamp pattern)
-        html_content = re.sub(r'\s*<a[^>]*>\s*\d+(?:hr)?\d*m\d*s(?:\d*s)?(?=[\s<]|$)\s*</a>\s*', '', html_content)
-        # Then remove any remaining timestamp text, including from titles/headings
-        html_content = re.sub(r'\s*\(\d+(?:hr)?\d*m\d*s(?:\d*s)?\)\s*', '', html_content)  # Remove timestamps in parentheses
-        html_content = re.sub(r'\s*\d+(?:hr)?\d*m\d*s(?:\d*s)?(?=[\s<]|$)\s*', '', html_content)  # Remove any other timestamps
-        html_content = re.sub(r'\s*0s\s*', '', html_content)  # Remove bare 0s
-
-        # Clean up any potential double spaces left behind
-        html_content = re.sub(r'\s+', ' ', html_content)
-        logging.debug(f"HTML content after timestamp removal: {html_content[:200]}...")  # Log for verification
-    
     # Add CSS and header after timestamp removal
     html_content = f"""<style>
         body {{ font-size: 150%; }}
