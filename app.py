@@ -416,39 +416,11 @@ def convert_html_to_pdf():
         html_content = re.sub(r'\s+', ' ', html_content)
         logging.debug(f"HTML content after timestamp removal: {html_content[:200]}...")  # Log for verification
     
-    # Download and encode favicon
-    try:
-        favicon_response = requests.get('https://swiftnotes.ai/favicon.ico')
-        if favicon_response.status_code == 200:
-            favicon_base64 = base64.b64encode(favicon_response.content).decode('utf-8')
-            favicon_html = f'<img src="data:image/x-icon;base64,{favicon_base64}" style="height: 20px; vertical-align: middle; margin-right: 5px;">'
-        else:
-            favicon_html = ''
-    except Exception as e:
-        logging.error(f"Failed to fetch favicon: {str(e)}")
-        favicon_html = ''
-    
     # Add CSS and header after timestamp removal
     html_content = f"""<style>
         body {{ font-size: 150%; }}
         a {{ color: black; text-decoration: none; }}
-        .header {{ 
-            font-size: 14px;
-            margin-bottom: 20px;
-            color: #666;
-            display: flex;
-            align-items: center;
-            position: absolute;
-            top: 10px;
-            left: 10px;
-        }}
-        .header img {{
-            height: 20px;
-            width: auto;
-            margin-right: 5px;
-        }}
     </style>
-    <div class="header">{favicon_html}swiftnotes.ai</div>
     <div style="margin-top: 40px;">""" + html_content + "</div>"
 
     # Create a temporary HTML file first
