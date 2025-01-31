@@ -180,8 +180,6 @@ def generate_tutorial(transcript_data, youtube_url):
     
     # Log the title of the tutorial only if there is a response
     if response:
-        title = response.text[:75]  
-        logging.info(f"{youtube_url}, {title}")  # Log the title
 
         # Replace [sec:XX] with hyperlinks
         video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', youtube_url)
@@ -357,6 +355,11 @@ def generate_tutorial_endpoint():
             # If the markdown does not exist, generate it
             tutorial = transcribe_youtube_video(video_id, video_url)
             
+
+            # log youtube url, visitor id, and title from tutorial 
+            title = tutorial[:75]
+            logging.info(f"YouTube URL: {video_url}, Visitor ID: {visitor_id}, Title: {title}")
+
             # Upload the markdown to S3
             s3_client.put_object(
                 Bucket=bucket_name,
