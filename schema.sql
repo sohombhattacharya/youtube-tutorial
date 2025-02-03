@@ -63,3 +63,19 @@ CREATE TABLE user_notes (
     UNIQUE(user_id, youtube_video_url)
 );
 
+-- Add indexes for better query performance
+CREATE INDEX idx_feedback_auth0_id ON user_feedback(auth0_id);
+CREATE INDEX idx_feedback_visitor_id ON user_feedback(visitor_id);
+CREATE INDEX idx_feedback_video_id ON user_feedback(youtube_video_id);
+
+CREATE TABLE user_feedback (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    auth0_id TEXT,
+    visitor_id TEXT,
+    youtube_video_id TEXT NOT NULL,
+    youtube_video_title TEXT NOT NULL,
+    feedback_text TEXT,
+    was_helpful BOOLEAN,
+    is_tldr BOOLEAN NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
