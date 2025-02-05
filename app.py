@@ -278,6 +278,9 @@ def generate_tutorial_endpoint():
             logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
             # Continue execution with default INACTIVE status
 
+    if auth0_id is None and visitor_id is None:
+        return jsonify({'error': 'No user or visitor ID provided'}), 400
+
     # Continue with the rest of the endpoint logic
     data = request.json
     video_url = data.get('url')
