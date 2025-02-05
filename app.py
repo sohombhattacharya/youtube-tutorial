@@ -281,7 +281,7 @@ def generate_tutorial_endpoint():
     # Continue with the rest of the endpoint logic
     data = request.json
     video_url = data.get('url')
-    logging.info(f"Received request at /generate_tutorial with video_url: {video_url}")
+    logging.info(f"Received request at /generate_tutorial with video_url: {video_url}, visitor_id: {visitor_id}, user_id: {auth0_id}")
         
     # Extract video ID from the URL
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
@@ -788,7 +788,7 @@ def get_visitor_notes():
 
 # Add Stripe configuration after other configurations
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
-stripe_endpoint_secret = os.getenv('STRIPE_WEBHOOK_SECRET')
+stripe_endpoint_secret = os.getenv('STRIPE_f_SECRET')
 
 @app.route('/webhook/stripe', methods=['POST'])
 def stripe_webhook():
@@ -1407,8 +1407,31 @@ def get_saved_notes():
             # Base query parameters
             query_params = [user['id']]
 
+            # Check if search query is a YouTube URL
+            video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', search_query)
+            
             # Modify queries based on search parameter
-            if search_query:
+            if video_id_match:
+                # If it's a YouTube URL, search by video ID in the youtube_video_url column
+                video_id = video_id_match.group(1)
+                count_query = """
+                    SELECT COUNT(*) 
+                    FROM user_notes 
+                    WHERE user_id = %s
+                    AND youtube_video_url LIKE %s
+                """
+                notes_query = """
+                    SELECT title, youtube_video_url, created_at
+                    FROM user_notes 
+                    WHERE user_id = %s
+                    AND youtube_video_url LIKE %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                # Use % wildcards to match any YouTube URL format containing the video ID
+                query_params = [user['id'], f'%{video_id}%']
+            elif search_query:
+                # Regular title search
                 search_pattern = f'%{search_query}%'
                 count_query = """
                     SELECT COUNT(*) 
@@ -1426,6 +1449,7 @@ def get_saved_notes():
                 """
                 query_params = [user['id'], search_pattern]
             else:
+                # No search query
                 count_query = """
                     SELECT COUNT(*) 
                     FROM user_notes 
