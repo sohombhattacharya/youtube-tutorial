@@ -248,7 +248,7 @@ def generate_tutorial_endpoint():
     visitor_id = request.json.get('visitor_id')
 
     subscription_status = 'INACTIVE'  # Default status
-    
+    auth0_id = None
     # Process Bearer token if present
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
