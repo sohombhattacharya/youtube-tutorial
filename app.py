@@ -1963,6 +1963,9 @@ def search_youtube_endpoint():
         if not search_query:
             return jsonify({'error': 'Search query is required'}), 400
         
+        # log info log for request from user
+        logging.info(f"Received request at /search_youtube with query: {search_query} from user {auth0_id}") 
+
         # Search YouTube with 25 results
         videos = search_youtube(search_query, API_KEY, max_results=25)
         
