@@ -5,6 +5,8 @@ import stripe  # Add this import at the top with other imports
 import fitz  # PyMuPDF
 import io
 import zipfile
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Configure logging - must be first!
 log_level = logging.DEBUG if os.getenv('APP_ENV') == 'development' else logging.INFO
@@ -401,7 +403,7 @@ def generate_tutorial_endpoint():
 def convert_html_to_pdf():
     data = request.json
     html_content = data.get('html')
-    youtube_url = data.get('url')  # Get the YouTube URL from the request
+    youtube_url = data.get('url')  # This will be None if not provided
     get_snippet_zip = data.get('get_snippet_zip', False)
     logging.info(f"Received request at /convert_html_to_pdf with video_url: {youtube_url}")
     
@@ -1874,6 +1876,504 @@ def check_feedback():
     except Exception as e:
         logging.error(f"Error in check_feedback: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
+
+def search_youtube(query, api_key, max_results=10):
+    """
+    Search YouTube for videos matching the query and return their URLs and titles.
+    
+    Args:
+        query (str): Search term
+        api_key (str): YouTube Data API key
+        max_results (int): Maximum number of results to return (default 10)
+    """
+    try:
+        # Create YouTube API client
+        youtube = build('youtube', 'v3', developerKey=api_key)
+        
+        # Call the search.list method
+        search_response = youtube.search().list(
+            q=query,
+            part='id,snippet',  # Added snippet to get video titles
+            maxResults=max_results,
+            type='video'  # Only search for videos
+        ).execute()
+        
+        # Extract video URLs and titles
+        videos = []
+        for item in search_response['items']:
+            video_id = item['id']['videoId']
+            video_url = f'https://www.youtube.com/watch?v={video_id}'
+            video_title = item['snippet']['title']
+            videos.append({'url': video_url, 'title': video_title})
+            
+        return videos
+        
+    except HttpError as e:
+        print(f'An HTTP error {e.resp.status} occurred: {e.content}')
+        return []
+
+@app.route('/search_youtube', methods=['GET'])
+def search_youtube_endpoint():
+    try:
+        # Get and verify token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
+
+        token = auth_header.split(' ')[1]
+        try:
+            decoded_token = jwt.decode(
+                token,
+                auth0_validator.public_key,
+                claims_options={
+                    "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                    "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
+            )
+            auth0_id = decoded_token['sub']
+
+            # Check user's subscription status and get user_id
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, subscription_status 
+                    FROM users 
+                    WHERE auth0_id = %s
+                    """,
+                    (auth0_id,)
+                )
+                result = cur.fetchone()
+                if not result or result[1] != 'ACTIVE':
+                    return jsonify({
+                        'error': 'Subscription required',
+                        'message': 'An active subscription is required to use this feature'
+                    }), 403
+                user_id = result[0]
+
+        except Exception as e:
+            logging.error(f"Error verifying token: {str(e)}")
+            return jsonify({'error': 'Authentication error'}), 401
+
+        # Replace with your actual API key
+        API_KEY = os.getenv('GOOGLE_API_KEY')
+        
+        # Get search query from user
+        search_query = request.args.get('query')
+        if not search_query:
+            return jsonify({'error': 'Search query is required'}), 400
+        
+        # log info log for request from user
+        logging.info(f"Received request at /search_youtube with query: {search_query} from user {auth0_id}") 
+
+        # Search YouTube with 25 results
+        videos = search_youtube(search_query, API_KEY, max_results=25)
+        
+        # Generate tutorials for each video
+        all_tutorials = []
+        for video in videos:
+            try:
+                video_url = video['url']
+                video_title = video['title']
+                
+                # Extract video ID from URL
+                video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
+                if not video_id_match:
+                    continue
+                video_id = video_id_match.group(1)
+                
+                # Check if tutorial exists in S3
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                )
+                bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                s3_key = f"notes/{video_id}"
+                
+                try:
+                    s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                    tutorial = s3_response['Body'].read().decode('utf-8')
+                except s3_client.exceptions.NoSuchKey:
+                    # Generate new tutorial if not found
+                    tutorial = transcribe_youtube_video(video_id, video_url)
+
+                    s3_client.put_object(
+                        Bucket=bucket_name,
+                        Key=s3_key,
+                        Body=tutorial,
+                        ContentType='text/plain'
+                    )
+                
+                all_tutorials.append({
+                    'title': video_title,
+                    'url': video_url,
+                    'content': tutorial
+                })
+                
+            except Exception as e:
+                logging.error(f"Error processing video {video_url}: {str(e)}")
+                continue
+        
+        # Generate comprehensive report using Gemini
+        if all_tutorials:
+            prompt = (
+                "# YouTube Video Analysis Task\n\n"
+                "## Objective\n"
+                "Create a comprehensive analysis of multiple YouTube video transcripts in valid markdown format. Don't mention in the title that this is an analysis of multiple YouTube video transcripts."
+                "The output must be strictly valid markdown without any escaped characters or formatting issues.\n\n"
+                "## Instructions\n"
+                "1. Structure your response with these sections:\n"
+                "   - Summary (brief overview) don't need to mention that this is a summary of multiple YouTube video transcripts\n"
+                "   - Main Themes and Patterns (numbered list with timestamps as links)\n"
+                "   - Key Insights (bullet points with timestamps as links)\n"
+                "   - Notable Quotes (with timestamps as links)\n"
+                "   - Conclusions\n\n"
+                "2. Formatting Requirements:\n"
+                "   - Use proper markdown headers (# for main title, ## for sections)\n"
+                "   - Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "   - Format quotes with > for blockquotes\n"
+                "   - Use **bold** for emphasis\n"
+                "   - Ensure all newlines are proper markdown line breaks\n"
+                "   - Do not use any escaped characters\n\n"
+                "3. Content Guidelines:\n"
+                "   - Focus on extracting key themes across all videos\n"
+                "   - Highlight contradictions or disagreements between sources\n"
+                "   - Include relevant timestamps and quotes\n"
+                "   - Draw meaningful conclusions\n\n"
+                f"## Query\n{search_query}\n\n"
+                "## Source Materials\n"
+                f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
+                "Analyze these materials and provide a comprehensive report in clean markdown format."
+            )
+            
+            # Add each tutorial's content with its source
+            for tutorial in all_tutorials:
+                prompt += f"\n### Video: {tutorial['title']}\n{tutorial['content']}\n"
+            
+            # Generate the report
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                # Get environment and base URL
+                is_dev = os.getenv('APP_ENV') == 'development'
+                base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
+                
+                # Create a mapping of video IDs to source numbers
+                video_id_to_source = {}
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        video_id_to_source[video_id] = i
+
+                # Update timestamp hyperlinks with source numbers
+                def add_source_number(match):
+                    url = match.group(0)
+                    
+                    # Only process links that are actual YouTube timestamp links
+                    if not ('youtu.be' in url and '?t=' in url):
+                        return url
+                        
+                    video_id_match = re.search(r'youtu\.be/([0-9A-Za-z_-]{11})', url)
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        source_num = video_id_to_source.get(video_id)
+                        if source_num:
+                            # Extract the display text (time) from the markdown link
+                            display_text_match = re.search(r'\[(.*?)\]', url)
+                            if not display_text_match:
+                                return url
+                            display_text = display_text_match.group(1)
+                            
+                            # Extract the URL part from the markdown link
+                            url_match = re.search(r'\((.*?)\)', url)
+                            if not url_match:
+                                return url
+                            url_part = url_match.group(1)
+                            
+                            # Verify this is a valid timestamp link before formatting
+                            if display_text and url_part and 'youtu.be' in url_part and '?t=' in url_part:
+                                return f'[({source_num}) {display_text}]({url_part})'
+                        return url
+                    return url
+
+                # Update the regex pattern to only match YouTube timestamp links
+                markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
+
+                # Add the sources section
+                markdown_content += "\n\n## Sources\n"
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        note_url = f"{base_url}/?v={video_id}"
+                        markdown_content += f"{i}. [{tutorial['title']}]({note_url})\n"
+                    else:
+                        markdown_content += f"{i}. [{tutorial['title']}]({tutorial['url']})\n"
+
+                # After generating the markdown content, save to database and S3
+                if markdown_content:
+                    try:
+                        # Extract title from markdown (first line starting with #)
+                        title = None
+                        for line in markdown_content.split('\n'):
+                            if line.startswith('# '):
+                                title = line.replace('# ', '').strip()
+                                break
+                        
+                        # Save to database first
+                        conn = get_db_connection()
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO user_reports 
+                                (user_id, search_query, title, created_at)
+                                VALUES (%s, %s, %s, NOW())
+                                RETURNING id
+                                """,
+                                (user_id, search_query, title)
+                            )
+                            report_id = cur.fetchone()[0]
+                            conn.commit()
+
+                        # Save to S3
+                        s3_client = boto3.client(
+                            's3',
+                            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                        )
+                        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                        s3_key = f"reports/{report_id}"
+
+                        s3_client.put_object(
+                            Bucket=bucket_name,
+                            Key=s3_key,
+                            Body=markdown_content,
+                            ContentType='text/plain'
+                        )
+
+                        return markdown_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
+                    except Exception as e:
+                        logging.error(f"Error saving report: {str(e)}")
+                        return jsonify({'error': 'Failed to save report'}), 500
+
+                else:
+                    return jsonify({'error': 'Failed to generate report'}), 500
+            
+    except Exception as e:
+        logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/get_reports', methods=['GET'])
+@require_auth(None)
+def get_reports():
+    try:
+        # Get token from Authorization header and decode it
+        token = request.headers.get('Authorization').split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+
+        # Get pagination parameters and search query from query string
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        search_query = request.args.get('search', '').strip()
+        offset = (page - 1) * per_page
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Check user's subscription status and get user_id
+            cur.execute("""
+                SELECT id, subscription_status 
+                FROM users 
+                WHERE auth0_id = %s
+            """, (auth0_id,))
+            
+            user = cur.fetchone()
+            if not user:
+                return jsonify({'error': 'User not found'}), 404
+            
+            if user['subscription_status'] != 'ACTIVE':
+                return jsonify({
+                    'error': 'Subscription required',
+                    'message': 'An active subscription is required to access reports'
+                }), 403
+
+            # Base query parameters
+            query_params = [user['id']]
+
+            # Modify queries based on search parameter
+            if search_query:
+                count_query = """
+                    SELECT COUNT(*) 
+                    FROM user_reports 
+                    WHERE user_id = %s
+                    AND (
+                        LOWER(title) LIKE LOWER(%s)
+                        OR LOWER(search_query) LIKE LOWER(%s)
+                    )
+                """
+                reports_query = """
+                    SELECT id, title, search_query, created_at
+                    FROM user_reports 
+                    WHERE user_id = %s
+                    AND (
+                        LOWER(title) LIKE LOWER(%s)
+                        OR LOWER(search_query) LIKE LOWER(%s)
+                    )
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                search_pattern = f'%{search_query}%'
+                query_params.extend([search_pattern, search_pattern])
+            else:
+                count_query = """
+                    SELECT COUNT(*) 
+                    FROM user_reports 
+                    WHERE user_id = %s
+                """
+                reports_query = """
+                    SELECT id, title, search_query, created_at
+                    FROM user_reports 
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+
+            # Get total count of reports
+            cur.execute(count_query, query_params)
+            total_reports = cur.fetchone()[0]
+
+            # Add pagination parameters to query
+            query_params.extend([per_page, offset])
+
+            # Get paginated reports
+            cur.execute(reports_query, query_params)
+            
+            # Create S3 client for fetching report content
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+            )
+            bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+
+            reports = []
+            for report in cur.fetchall():
+                try:
+                    # Get report content from S3
+                    s3_key = f"reports/{report['id']}"
+                    s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                    content = s3_response['Body'].read().decode('utf-8')
+                    
+                    reports.append({
+                        'id': report['id'],
+                        'title': report['title'],
+                        'search_query': report['search_query'],
+                        'content': content,
+                        'created_at': report['created_at'].isoformat()
+                    })
+                except Exception as e:
+                    logging.error(f"Error fetching report content from S3: {str(e)}")
+                    # Skip this report if we can't fetch its content
+                    continue
+
+            return jsonify({
+                'reports': reports,
+                'pagination': {
+                    'total': total_reports,
+                    'page': page,
+                    'per_page': per_page,
+                    'total_pages': (total_reports + per_page - 1) // per_page
+                }
+            }), 200
+
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in get_reports: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/get_report/<string:report_id>', methods=['GET'])
+@require_auth(None)
+def get_report_by_id(report_id):
+    try:
+        # Get token from Authorization header and decode it
+        token = request.headers.get('Authorization').split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Check user's subscription status and verify report ownership
+            cur.execute("""
+                SELECT u.subscription_status, r.id, r.title, r.search_query, r.created_at
+                FROM users u
+                LEFT JOIN user_reports r ON r.user_id = u.id
+                WHERE u.auth0_id = %s AND r.id = %s
+            """, (auth0_id, report_id))
+            
+            result = cur.fetchone()
+            if not result:
+                return jsonify({'error': 'Report not found'}), 404
+            
+            if result['subscription_status'] != 'ACTIVE':
+                return jsonify({
+                    'error': 'Subscription required',
+                    'message': 'An active subscription is required to access reports'
+                }), 403
+
+            try:
+                # Get report content from S3
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                )
+                bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                s3_key = f"reports/{report_id}"
+                
+                s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                content = s3_response['Body'].read().decode('utf-8')
+                
+                return jsonify({
+                    'id': result['id'],
+                    'title': result['title'],
+                    'search_query': result['search_query'],
+                    'content': content,
+                    'created_at': result['created_at'].isoformat()
+                }), 200
+
+            except Exception as e:
+                logging.error(f"Error fetching report content from S3: {str(e)}")
+                return jsonify({'error': 'Failed to retrieve report content'}), 500
+
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in get_report_by_id: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+
 
 if __name__ == "__main__":
     app.run(debug=True)

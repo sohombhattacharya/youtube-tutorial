@@ -79,3 +79,11 @@ CREATE TABLE user_feedback (
     is_tldr BOOLEAN NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE user_reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),  
+    title TEXT NOT NULL,
+    search_query TEXT NOT NULL, 
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+);
