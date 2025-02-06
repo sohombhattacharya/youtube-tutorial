@@ -5,6 +5,8 @@ import stripe  # Add this import at the top with other imports
 import fitz  # PyMuPDF
 import io
 import zipfile
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Configure logging - must be first!
 log_level = logging.DEBUG if os.getenv('APP_ENV') == 'development' else logging.INFO
@@ -1874,6 +1876,158 @@ def check_feedback():
     except Exception as e:
         logging.error(f"Error in check_feedback: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
+
+def search_youtube(query, api_key, max_results=10):
+    """
+    Search YouTube for videos matching the query and return their URLs and titles.
+    
+    Args:
+        query (str): Search term
+        api_key (str): YouTube Data API key
+        max_results (int): Maximum number of results to return (default 10)
+    """
+    try:
+        # Create YouTube API client
+        youtube = build('youtube', 'v3', developerKey=api_key)
+        
+        # Call the search.list method
+        search_response = youtube.search().list(
+            q=query,
+            part='id,snippet',  # Added snippet to get video titles
+            maxResults=max_results,
+            type='video'  # Only search for videos
+        ).execute()
+        
+        # Extract video URLs and titles
+        videos = []
+        for item in search_response['items']:
+            video_id = item['id']['videoId']
+            video_url = f'https://www.youtube.com/watch?v={video_id}'
+            video_title = item['snippet']['title']
+            videos.append({'url': video_url, 'title': video_title})
+            
+        return videos
+        
+    except HttpError as e:
+        print(f'An HTTP error {e.resp.status} occurred: {e.content}')
+        return []
+
+@app.route('/search_youtube', methods=['GET'])
+def search_youtube_endpoint():
+    try:
+        # Replace with your actual API key
+        API_KEY = os.getenv('GOOGLE_API_KEY')
+        
+        # Get search query from user
+        search_query = request.args.get('query')
+        if not search_query:
+            return jsonify({'error': 'Search query is required'}), 400
+        
+        # Search YouTube with 25 results
+        videos = search_youtube(search_query, API_KEY, max_results=25)
+        
+        # Generate tutorials for each video
+        all_tutorials = []
+        for video in videos:
+            try:
+                video_url = video['url']
+                video_title = video['title']
+                
+                # Extract video ID from URL
+                video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
+                if not video_id_match:
+                    continue
+                video_id = video_id_match.group(1)
+                
+                # Check if tutorial exists in S3
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                )
+                bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                s3_key = f"notes/{video_id}"
+                
+                try:
+                    s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                    tutorial = s3_response['Body'].read().decode('utf-8')
+                except s3_client.exceptions.NoSuchKey:
+                    # Generate new tutorial if not found
+                    tutorial = transcribe_youtube_video(video_id, video_url)
+
+                    s3_client.put_object(
+                        Bucket=bucket_name,
+                        Key=s3_key,
+                        Body=tutorial,
+                        ContentType='text/plain'
+                    )
+                
+                all_tutorials.append({
+                    'title': video_title,
+                    'url': video_url,
+                    'content': tutorial
+                })
+                
+            except Exception as e:
+                logging.error(f"Error processing video {video_url}: {str(e)}")
+                continue
+        
+        # Generate comprehensive report using Gemini
+        if all_tutorials:
+            prompt = (
+                "# YouTube Video Analysis Task\n\n"
+                "## Objective\n"
+                "Create a comprehensive analysis of multiple YouTube video transcripts in valid markdown format. "
+                "The output must be strictly valid markdown without any escaped characters or formatting issues.\n\n"
+                "## Instructions\n"
+                "1. Structure your response with these sections:\n"
+                "   - Summary (brief overview)\n"
+                "   - Main Themes and Patterns (numbered list)\n"
+                "   - Key Insights (bullet points)\n"
+                "   - Notable Quotes (with timestamps as links)\n"
+                "   - Conclusions\n\n"
+                "2. Formatting Requirements:\n"
+                "   - Use proper markdown headers (# for main title, ## for sections)\n"
+                "   - Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "   - Format quotes with > for blockquotes\n"
+                "   - Use **bold** for emphasis\n"
+                "   - Ensure all newlines are proper markdown line breaks\n"
+                "   - Do not use any escaped characters\n\n"
+                "3. Content Guidelines:\n"
+                "   - Focus on extracting key themes across all videos\n"
+                "   - Highlight contradictions or disagreements between sources\n"
+                "   - Include relevant timestamps and quotes\n"
+                "   - Draw meaningful conclusions\n\n"
+                f"## Query\n{search_query}\n\n"
+                "## Source Materials\n"
+                f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
+                "Analyze these materials and provide a comprehensive report in clean markdown format."
+            )
+            
+            # Add each tutorial's content with its source
+            for tutorial in all_tutorials:
+                prompt += f"\n### Video: {tutorial['title']}\n{tutorial['content']}\n"
+            
+            # Generate the report
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                # Clean up the markdown text and add sources
+                markdown_content = response.text.strip() + "\n\n## Sources\n"
+                for tutorial in all_tutorials:
+                    markdown_content += f"- [{tutorial['title']}]({tutorial['url']})\n"
+                
+                return markdown_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+            else:
+                return jsonify({'error': 'Failed to generate report'}), 500
+            
+    except Exception as e:
+        logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+
 
 if __name__ == "__main__":
     app.run(debug=True)
