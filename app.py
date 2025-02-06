@@ -1915,6 +1915,41 @@ def search_youtube(query, api_key, max_results=10):
 @app.route('/search_youtube', methods=['GET'])
 def search_youtube_endpoint():
     try:
+        # Get and verify token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
+
+        token = auth_header.split(' ')[1]
+        try:
+            decoded_token = jwt.decode(
+                token,
+                auth0_validator.public_key,
+                claims_options={
+                    "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                    "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
+            )
+            auth0_id = decoded_token['sub']
+
+            # Check user's subscription status
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT subscription_status FROM users WHERE auth0_id = %s",
+                    (auth0_id,)
+                )
+                result = cur.fetchone()
+                if not result or result[0] != 'ACTIVE':
+                    return jsonify({
+                        'error': 'Subscription required',
+                        'message': 'An active subscription is required to use this feature'
+                    }), 403
+
+        except Exception as e:
+            logging.error(f"Error verifying token: {str(e)}")
+            return jsonify({'error': 'Authentication error'}), 401
+
         # Replace with your actual API key
         API_KEY = os.getenv('GOOGLE_API_KEY')
         
@@ -1982,8 +2017,8 @@ def search_youtube_endpoint():
                 "## Instructions\n"
                 "1. Structure your response with these sections:\n"
                 "   - Summary (brief overview)\n"
-                "   - Main Themes and Patterns (numbered list)\n"
-                "   - Key Insights (bullet points)\n"
+                "   - Main Themes and Patterns (numbered list with timestamps as links)\n"
+                "   - Key Insights (bullet points with timestamps as links)\n"
                 "   - Notable Quotes (with timestamps as links)\n"
                 "   - Conclusions\n\n"
                 "2. Formatting Requirements:\n"
