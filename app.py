@@ -403,7 +403,7 @@ def generate_tutorial_endpoint():
 def convert_html_to_pdf():
     data = request.json
     html_content = data.get('html')
-    youtube_url = data.get('url')  # Get the YouTube URL from the request
+    youtube_url = data.get('url')  # This will be None if not provided
     get_snippet_zip = data.get('get_snippet_zip', False)
     logging.info(f"Received request at /convert_html_to_pdf with video_url: {youtube_url}")
     
@@ -2012,11 +2012,11 @@ def search_youtube_endpoint():
             prompt = (
                 "# YouTube Video Analysis Task\n\n"
                 "## Objective\n"
-                "Create a comprehensive analysis of multiple YouTube video transcripts in valid markdown format. "
+                "Create a comprehensive analysis of multiple YouTube video transcripts in valid markdown format. Don't mention in the title that this is an analysis of multiple YouTube video transcripts."
                 "The output must be strictly valid markdown without any escaped characters or formatting issues.\n\n"
                 "## Instructions\n"
                 "1. Structure your response with these sections:\n"
-                "   - Summary (brief overview)\n"
+                "   - Summary (brief overview) don't need to mention that this is a summary of multiple YouTube video transcripts\n"
                 "   - Main Themes and Patterns (numbered list with timestamps as links)\n"
                 "   - Key Insights (bullet points with timestamps as links)\n"
                 "   - Notable Quotes (with timestamps as links)\n"
@@ -2052,19 +2052,59 @@ def search_youtube_endpoint():
                 is_dev = os.getenv('APP_ENV') == 'development'
                 base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
                 
-                # Clean up the markdown text and add sources
-                markdown_content = response.text.strip() + "\n\n## Sources\n"
-                for tutorial in all_tutorials:
-                    # Extract video ID from URL
+                # Create a mapping of video IDs to source numbers
+                video_id_to_source = {}
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        video_id_to_source[video_id] = i
+
+                # Update timestamp hyperlinks with source numbers
+                def add_source_number(match):
+                    url = match.group(0)
+                    
+                    # Only process links that are actual YouTube timestamp links
+                    if not ('youtu.be' in url and '?t=' in url):
+                        return url
+                        
+                    video_id_match = re.search(r'youtu\.be/([0-9A-Za-z_-]{11})', url)
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        source_num = video_id_to_source.get(video_id)
+                        if source_num:
+                            # Extract the display text (time) from the markdown link
+                            display_text_match = re.search(r'\[(.*?)\]', url)
+                            if not display_text_match:
+                                return url
+                            display_text = display_text_match.group(1)
+                            
+                            # Extract the URL part from the markdown link
+                            url_match = re.search(r'\((.*?)\)', url)
+                            if not url_match:
+                                return url
+                            url_part = url_match.group(1)
+                            
+                            # Verify this is a valid timestamp link before formatting
+                            if display_text and url_part and 'youtu.be' in url_part and '?t=' in url_part:
+                                return f'[({source_num}) {display_text}]({url_part})'
+                        return url
+                    return url
+
+                # Update the regex pattern to only match YouTube timestamp links
+                markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
+
+                # Add the sources section
+                markdown_content += "\n\n## Sources\n"
+                for i, tutorial in enumerate(all_tutorials, 1):
                     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
                     if video_id_match:
                         video_id = video_id_match.group(1)
                         note_url = f"{base_url}/?v={video_id}"
-                        markdown_content += f"- [{tutorial['title']}]({note_url})\n"
+                        markdown_content += f"{i}. [{tutorial['title']}]({note_url})\n"
                     else:
-                        # Fallback to YouTube URL if video ID extraction fails
-                        markdown_content += f"- [{tutorial['title']}]({tutorial['url']})\n"
-                
+                        markdown_content += f"{i}. [{tutorial['title']}]({tutorial['url']})\n"
+
                 return markdown_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
             else:
                 return jsonify({'error': 'Failed to generate report'}), 500
