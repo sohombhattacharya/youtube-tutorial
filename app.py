@@ -2048,10 +2048,22 @@ def search_youtube_endpoint():
             response = model.generate_content(prompt)
             
             if response and response.text:
+                # Get environment and base URL
+                is_dev = os.getenv('APP_ENV') == 'development'
+                base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
+                
                 # Clean up the markdown text and add sources
                 markdown_content = response.text.strip() + "\n\n## Sources\n"
                 for tutorial in all_tutorials:
-                    markdown_content += f"- [{tutorial['title']}]({tutorial['url']})\n"
+                    # Extract video ID from URL
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        note_url = f"{base_url}/?v={video_id}"
+                        markdown_content += f"- [{tutorial['title']}]({note_url})\n"
+                    else:
+                        # Fallback to YouTube URL if video ID extraction fails
+                        markdown_content += f"- [{tutorial['title']}]({tutorial['url']})\n"
                 
                 return markdown_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
             else:
