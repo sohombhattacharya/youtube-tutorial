@@ -2033,6 +2033,7 @@ def search_youtube_endpoint():
                 "   - For comparisons: Examine nuanced differences and complex trade-offs\n"
                 "   - For how-to queries: Include detailed methodology and consideration of edge cases\n\n"
                 "## Content Guidelines\n"
+                " - Create a title for the report that is a summary of the report\n"
                 "- Structure the response in the most logical way for this specific query\n"
                 "- Deeply analyze different perspectives and approaches\n"
                 "- Highlight both obvious and subtle connections between sources\n"
