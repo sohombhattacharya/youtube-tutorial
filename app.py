@@ -2018,33 +2018,53 @@ def search_youtube_endpoint():
         # Generate comprehensive report using Gemini
         if all_tutorials:
             prompt = (
-                "# YouTube Video Analysis Task\n\n"
-                "## Objective\n"
-                "Create a comprehensive analysis of multiple YouTube video transcripts in valid markdown format. Don't mention in the title that this is an analysis of multiple YouTube video transcripts."
-                "The output must be strictly valid markdown without any escaped characters or formatting issues.\n\n"
-                "## Instructions\n"
-                "1. Structure your response with these sections:\n"
-                "   - Summary (brief overview) don't need to mention that this is a summary of multiple YouTube video transcripts\n"
-                "   - Main Themes and Patterns (numbered list with timestamps as links)\n"
-                "   - Key Insights (bullet points with timestamps as links)\n"
-                "   - Notable Quotes (with timestamps as links)\n"
-                "   - Conclusions\n\n"
-                "2. Formatting Requirements:\n"
-                "   - Use proper markdown headers (# for main title, ## for sections)\n"
-                "   - Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
-                "   - Format quotes with > for blockquotes\n"
-                "   - Use **bold** for emphasis\n"
-                "   - Ensure all newlines are proper markdown line breaks\n"
-                "   - Do not use any escaped characters\n\n"
-                "3. Content Guidelines:\n"
-                "   - Focus on extracting key themes across all videos\n"
-                "   - Highlight contradictions or disagreements between sources\n"
-                "   - Include relevant timestamps and quotes\n"
-                "   - Draw meaningful conclusions\n\n"
-                f"## Query\n{search_query}\n\n"
+                "# Analysis Task\n\n"
+                f"## User Query\n{search_query}\n\n"
+                "## Task Overview\n"
+                "1. First, analyze the user's query to understand:\n"
+                "   - Is this a specific question seeking direct answers?\n"
+                "   - Is this a broad topic requiring synthesis and exploration?\n"
+                "   - What are the key aspects or dimensions that need to be addressed?\n"
+                "   - What would be most valuable to the user based on their query?\n"
+                "   - What deeper implications or connections should be explored?\n\n"
+                "2. Then, without mentioning the type of the user's query, and without mentioning that this is an analysis of video transcripts, structure your response appropriately based on the query type. For example:\n"
+                "   - For specific questions: Provide comprehensive answers with in-depth analysis and multiple perspectives\n"
+                "   - For broad topics: Deliver thorough synthesis with detailed exploration of key themes\n"
+                "   - For comparisons: Examine nuanced differences and complex trade-offs\n"
+                "   - For how-to queries: Include detailed methodology and consideration of edge cases\n\n"
+                "## Content Guidelines\n"
+                "- Structure the response in the most logical way for this specific query\n"
+                "- Deeply analyze different perspectives and approaches\n"
+                "- Highlight both obvious and subtle connections between sources\n"
+                "- Examine any contradictions or disagreements in detail\n"
+                "- Draw meaningful conclusions that directly relate to the query\n"
+                "- Consider practical implications and real-world applications\n"
+                "- Explore edge cases and potential limitations\n"
+                "- Identify patterns and trends across sources\n\n"
+                "## Citation and Reference Guidelines\n"
+                "- Include timestamp links whenever referencing specific content\n"
+                "- Add timestamps for:\n"
+                "  * Direct quotes or key statements\n"
+                "  * Important examples or demonstrations\n"
+                "  * Technical explanations or tutorials\n"
+                "  * Expert opinions or insights\n"
+                "  * Supporting evidence for major claims\n"
+                "  * Contrasting viewpoints or approaches\n"
+                "- Format timestamps as markdown links to specific moments in the videos\n"
+                "- Integrate timestamps naturally into the text to maintain readability\n"
+                "- Use multiple timestamps when a point is supported across different sources\n\n"
+                "## Formatting Requirements\n"
+                "- Use proper markdown headers (# for main title, ## for sections)\n"
+                "- Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "- Format quotes with > for blockquotes\n"
+                "- Use **bold** for emphasis\n"
+                "- Ensure all newlines are proper markdown line breaks\n"
+                "- Format timestamps as [MM:SS](video-link) or similar\n\n"
                 "## Source Materials\n"
                 f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
-                "Analyze these materials and provide a comprehensive report in clean markdown format."
+                "Analyze these materials thoroughly to provide a detailed, well-reasoned response that best serves the user's needs. "
+                "Don't summarize - dig deep into the content and explore all relevant aspects and implications. "
+                "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
             )
             
             # Add each tutorial's content with its source
@@ -2116,27 +2136,49 @@ def search_youtube_endpoint():
                 # After generating the markdown content, save to database and S3
                 if markdown_content:
                     try:
-                        # Extract title from markdown (first line starting with #)
-                        title = None
-                        for line in markdown_content.split('\n'):
-                            if line.startswith('# '):
-                                title = line.replace('# ', '').strip()
-                                break
-                        
-                        # Save to database first
-                        conn = get_db_connection()
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                INSERT INTO user_reports 
-                                (user_id, search_query, title, created_at)
-                                VALUES (%s, %s, %s, NOW())
-                                RETURNING id
-                                """,
-                                (user_id, search_query, title)
-                            )
-                            report_id = cur.fetchone()[0]
-                            conn.commit()
+                        # Extract title with more robust logic
+                        try:
+                            # First try to get title from first # header
+                            title = None
+                            for line in markdown_content.split('\n'):
+                                if line.startswith('# '):
+                                    title = line.replace('# ', '').strip()
+                                    break
+                            
+                            # If no title found, try first line or use fallback
+                            if not title:
+                                first_line = markdown_content.split('\n')[0].strip()
+                                if first_line:
+                                    title = first_line[:100]  # Limit length
+                                else:
+                                    title = f"Research Report: {search_query[:50]}"  # Fallback title
+                            
+                            # Ensure title is not None or empty
+                            if not title or len(title.strip()) == 0:
+                                title = f"Research Report: {search_query[:50]}"
+                                
+                            logging.info(f"Extracted title: {title}")
+
+                            # Save to database with error handling
+                            conn = get_db_connection()
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO user_reports 
+                                    (user_id, search_query, title, created_at)
+                                    VALUES (%s, %s, %s, NOW())
+                                    RETURNING id
+                                    """,
+                                    (user_id, search_query, title)
+                                )
+                                report_id = cur.fetchone()[0]
+                                conn.commit()
+                                
+                        except Exception as e:
+                            logging.error(f"Error saving report to database: {str(e)}")
+                            # Use a default title if database insert fails
+                            title = f"Research Report: {search_query[:50]}"
+                            return jsonify({'error': 'Failed to save report'}), 500
 
                         # Save to S3
                         s3_client = boto3.client(
