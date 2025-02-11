@@ -793,7 +793,7 @@ def get_visitor_notes():
 
 # Add Stripe configuration after other configurations
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
-stripe_endpoint_secret = os.getenv('STRIPE_f_SECRET')
+stripe_endpoint_secret = os.getenv('STRIPE_WEBHOOK_SECRET')
 
 @app.route('/webhook/stripe', methods=['POST'])
 def stripe_webhook():
