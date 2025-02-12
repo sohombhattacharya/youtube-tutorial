@@ -2145,6 +2145,9 @@ def search_youtube_endpoint():
                                 if line.startswith('# '):
                                     title = line.replace('# ', '').strip()
                                     break
+                                if line.startswith('## '):
+                                    title = line.replace('## ', '').strip()
+                                    break
                             
                             # If no title found, try first line or use fallback
                             if not title:
