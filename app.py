@@ -1916,56 +1916,82 @@ def search_youtube(query, api_key, max_results=10):
 @app.route('/search_youtube', methods=['GET'])
 def search_youtube_endpoint():
     try:
-        # Get and verify token from Authorization header
         auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'Authentication required'}), 401
+        visitor_id = request.args.get('visitor_id')
+        search_query = request.args.get('query')
+        
+        if not search_query:
+            return jsonify({'error': 'Search query is required'}), 400
 
-        token = auth_header.split(' ')[1]
-        try:
-            decoded_token = jwt.decode(
-                token,
-                auth0_validator.public_key,
-                claims_options={
-                    "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
-                    "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
-                }
-            )
-            auth0_id = decoded_token['sub']
+        # Handle authenticated users first
+        if auth_header and auth_header.startswith('Bearer '):
+            # ... existing auth user logic ...
+            token = auth_header.split(' ')[1]
+            try:
+                decoded_token = jwt.decode(
+                    token,
+                    auth0_validator.public_key,
+                    claims_options={
+                        "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                        "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                    }
+                )
+                auth0_id = decoded_token['sub']
 
-            # Check user's subscription status and get user_id
+                # Check user's subscription status and get user_id
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, subscription_status 
+                        FROM users 
+                        WHERE auth0_id = %s
+                        """,
+                        (auth0_id,)
+                    )
+                    result = cur.fetchone()
+                    if not result or result[1] != 'ACTIVE':
+                        return jsonify({
+                            'error': 'Subscription required',
+                            'message': 'An active subscription is required to use this feature'
+                        }), 403
+                    user_id = result[0]
+
+            except Exception as e:
+                logging.error(f"Error verifying token: {str(e)}")
+                return jsonify({'error': 'Authentication error'}), 401
+
+        # If no auth header, check visitor_id and their report limit
+        elif not visitor_id:
+            return jsonify({'error': 'Authentication or visitor ID required'}), 401
+        else:
+            # Check if visitor has already generated a report
             conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, subscription_status 
-                    FROM users 
-                    WHERE auth0_id = %s
+                    SELECT COUNT(*) 
+                    FROM visitor_reports 
+                    WHERE visitor_id = %s
                     """,
-                    (auth0_id,)
+                    (visitor_id,)
                 )
-                result = cur.fetchone()
-                if not result or result[1] != 'ACTIVE':
+                report_count = cur.fetchone()[0]
+                
+                if report_count >= 1:
                     return jsonify({
-                        'error': 'Subscription required',
-                        'message': 'An active subscription is required to use this feature'
+                        'error': 'Report limit reached',
+                        'message': 'You have reached the maximum number of free reports. Please sign up for unlimited access.'
                     }), 403
-                user_id = result[0]
-
-        except Exception as e:
-            logging.error(f"Error verifying token: {str(e)}")
-            return jsonify({'error': 'Authentication error'}), 401
 
         # Replace with your actual API key
         API_KEY = os.getenv('GOOGLE_API_KEY')
         
-        # Get search query from user
-        search_query = request.args.get('query')
-        if not search_query:
-            return jsonify({'error': 'Search query is required'}), 400
-        
-        # log info log for request from user
-        logging.info(f"Received request at /search_youtube with query: {search_query} from user {auth0_id}") 
+        # Log info for request
+        if auth_header:
+            logging.info(f"Received request at /search_youtube with query: {search_query} from user {auth0_id}")
+        else:
+            logging.info(f"Received request at /search_youtube with query: {search_query} from visitor {visitor_id}")
 
         # Search YouTube with 25 results
         videos = search_youtube(search_query, API_KEY, max_results=25)
@@ -2015,7 +2041,7 @@ def search_youtube_endpoint():
             except Exception as e:
                 logging.error(f"Error processing video {video_url}: {str(e)}")
                 continue
-        
+
         # Generate comprehensive report using Gemini
         if all_tutorials:
             prompt = (
@@ -2135,12 +2161,12 @@ def search_youtube_endpoint():
                     else:
                         markdown_content += f"{i}. [{tutorial['title']}]({tutorial['url']})\n"
 
-                # After generating the markdown content, save to database and S3
+                # After generating the markdown content, handle differently for auth vs visitor
                 if markdown_content:
-                    try:
-                        # Extract title with more robust logic
+                    if auth_header:
                         try:
-                            # First try to get title from first # header
+                            # ... existing auth user report saving logic ...
+                            # Extract title
                             title = None
                             for line in markdown_content.split('\n'):
                                 if line.startswith('# '):
@@ -2150,21 +2176,19 @@ def search_youtube_endpoint():
                                     title = line.replace('## ', '').strip()
                                     break
                             
-                            # If no title found, try first line or use fallback
                             if not title:
                                 first_line = markdown_content.split('\n')[0].strip()
                                 if first_line:
-                                    title = first_line[:100]  # Limit length
+                                    title = first_line[:100]
                                 else:
-                                    title = f"Research Report: {search_query[:50]}"  # Fallback title
+                                    title = f"Research Report: {search_query[:50]}"
                             
-                            # Ensure title is not None or empty
                             if not title or len(title.strip()) == 0:
                                 title = f"Research Report: {search_query[:50]}"
                                 
                             logging.info(f"Extracted title: {title}")
 
-                            # Save to database with error handling
+                            # Save to database
                             conn = get_db_connection()
                             with conn.cursor() as cur:
                                 cur.execute(
@@ -2178,35 +2202,38 @@ def search_youtube_endpoint():
                                 )
                                 report_id = cur.fetchone()[0]
                                 conn.commit()
-                                
+
+                            # Save to S3
+                            s3_key = f"reports/{report_id}"
+                            s3_client.put_object(
+                                Bucket=bucket_name,
+                                Key=s3_key,
+                                Body=markdown_content,
+                                ContentType='text/plain'
+                            )
+
                         except Exception as e:
-                            logging.error(f"Error saving report to database: {str(e)}")
-                            # Use a default title if database insert fails
-                            title = f"Research Report: {search_query[:50]}"
+                            logging.error(f"Error saving report: {str(e)}")
                             return jsonify({'error': 'Failed to save report'}), 500
+                    else:
+                        # For visitors, just save to visitor_reports table
+                        try:
+                            conn = get_db_connection()
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO visitor_reports 
+                                    (visitor_id, search_query)
+                                    VALUES (%s, %s)
+                                    """,
+                                    (visitor_id, search_query)
+                                )
+                                conn.commit()
+                        except Exception as e:
+                            logging.error(f"Error saving visitor report: {str(e)}")
+                            # Continue even if saving fails
 
-                        # Save to S3
-                        s3_client = boto3.client(
-                            's3',
-                            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
-                        )
-                        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
-                        s3_key = f"reports/{report_id}"
-
-                        s3_client.put_object(
-                            Bucket=bucket_name,
-                            Key=s3_key,
-                            Body=markdown_content,
-                            ContentType='text/plain'
-                        )
-
-                        return markdown_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
-
-                    except Exception as e:
-                        logging.error(f"Error saving report: {str(e)}")
-                        return jsonify({'error': 'Failed to save report'}), 500
-
+                    return markdown_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
                 else:
                     return jsonify({'error': 'Failed to generate report'}), 500
             
@@ -2489,6 +2516,30 @@ def delete_note():
         return jsonify({'error': 'Invalid authentication token'}), 401
     except Exception as e:
         logging.error(f"Error in delete_note: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/get_visitor_reports', methods=['POST'])
+def get_visitor_reports():
+    data = request.json
+    visitor_id = data.get('visitor_id')
+    
+    if not visitor_id:
+        return jsonify({'error': 'Visitor ID is required'}), 400
+        
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Count existing reports for this visitor
+            cur.execute("SELECT COUNT(*) FROM visitor_reports WHERE visitor_id = %s", (visitor_id,))
+            used_reports = cur.fetchone()[0]
+            
+            return jsonify({
+                'used_reports': used_reports,
+                'total_free_reports': 1
+            }), 200
+
+    except Exception as e:
+        logging.error(f"Database error checking visitor reports: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 
