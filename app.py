@@ -1445,7 +1445,7 @@ def get_saved_notes():
                     AND LOWER(title) LIKE LOWER(%s)
                 """
                 notes_query = """
-                    SELECT title, youtube_video_url, created_at
+                    SELECT id, title, youtube_video_url, created_at
                     FROM user_notes 
                     WHERE user_id = %s
                     AND LOWER(title) LIKE LOWER(%s)
@@ -1461,7 +1461,7 @@ def get_saved_notes():
                     WHERE user_id = %s
                 """
                 notes_query = """
-                    SELECT title, youtube_video_url, created_at
+                    SELECT id, title, youtube_video_url, created_at
                     FROM user_notes 
                     WHERE user_id = %s
                     ORDER BY created_at DESC
@@ -1479,6 +1479,7 @@ def get_saved_notes():
             cur.execute(notes_query, query_params)
             
             notes = [{
+                'id': note['id'],
                 'title': note['title'],
                 'url': note['youtube_video_url'],
                 'created_at': note['created_at'].isoformat()
@@ -2416,6 +2417,78 @@ def get_report_by_id(report_id):
         return jsonify({'error': 'Invalid authentication token'}), 401
     except Exception as e:
         logging.error(f"Error in get_report_by_id: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/delete_note', methods=['POST'])
+@require_auth(None)
+def delete_note():
+    try:
+        # Get token from Authorization header and decode it
+        token = request.headers.get('Authorization').split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+
+        # Get note ID from request
+        data = request.json
+        note_id = data.get('id')
+        if not note_id:
+            return jsonify({'error': 'Note ID is required'}), 400
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Check user's subscription status and get user_id
+            cur.execute("""
+                SELECT id, subscription_status 
+                FROM users 
+                WHERE auth0_id = %s
+            """, (auth0_id,))
+            
+            user = cur.fetchone()
+            if not user:
+                return jsonify({'error': 'User not found'}), 404
+            
+            if user['subscription_status'] != 'ACTIVE':
+                return jsonify({
+                    'error': 'Subscription required',
+                    'message': 'An active subscription is required to manage saved notes'
+                }), 403
+
+            # Delete the note, ensuring it belongs to the user
+            try:
+                cur.execute("""
+                    DELETE FROM user_notes 
+                    WHERE user_id = %s AND id = %s
+                    RETURNING id
+                """, (user['id'], note_id))
+                conn.commit()
+                
+                deleted_note = cur.fetchone()
+                if deleted_note:
+                    return jsonify({
+                        'message': 'Note deleted successfully'
+                    }), 200
+                else:
+                    return jsonify({
+                        'error': 'Note not found'
+                    }), 404
+
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Database error deleting note: {str(e)}")
+                return jsonify({'error': 'Failed to delete note'}), 500
+
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in delete_note: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 
