@@ -85,5 +85,11 @@ CREATE TABLE user_reports (
     user_id UUID REFERENCES users(id),  
     title TEXT NOT NULL,
     search_query TEXT NOT NULL, 
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE visitor_reports (
+    visitor_id TEXT NOT NULL,  
+    search_query TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
 );
