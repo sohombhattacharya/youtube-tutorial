@@ -1978,7 +1978,7 @@ def search_youtube_endpoint():
                 )
                 report_count = cur.fetchone()[0]
                 
-                if report_count >= 1:
+                if report_count >= 2:
                     return jsonify({
                         'error': 'Report limit reached',
                         'message': 'You have reached the maximum number of free reports. Please sign up for unlimited access.'
@@ -2535,7 +2535,7 @@ def get_visitor_reports():
             
             return jsonify({
                 'used_reports': used_reports,
-                'total_free_reports': 1
+                'total_free_reports': 2
             }), 200
 
     except Exception as e:
