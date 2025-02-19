@@ -737,6 +737,7 @@ def generate_quiz():
         "Ensure the questions are challenging and require critical thinking. "
         "The options should be plausible and similar in nature to make it difficult to identify the correct answer. "
         "The correctAnswer should be one of the options, and provide an explanation for each correct answer. "
+        "The correctAnswer position should be randomly selected. we should not, for example, have lots of questions with the correct answer in the same position. "
         "Encourage the model to use nuanced language and scenarios related to the NFL Sunday Ticket to create engaging questions. "
         f"Markdown Content:\n{markdown_content}"
     )
