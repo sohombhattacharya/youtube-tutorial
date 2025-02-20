@@ -40,7 +40,7 @@ werkzeug_logger.setLevel(logging.ERROR)
 logging.info("=== Application Starting ===")
 logging.debug("Debug logging enabled - running in development mode")
 
-from flask import Flask, request, jsonify, send_file, abort, g
+from flask import Flask, request, jsonify, send_file, abort, g, make_response
 from flask_cors import CORS
 import os
 import google.generativeai as genai
@@ -2164,6 +2164,7 @@ def search_youtube_endpoint():
 
                 # After generating the markdown content, handle differently for auth vs visitor
                 if markdown_content:
+                    report_id = None
                     if auth_header:
                         try:
                             # ... existing auth user report saving logic ...
@@ -2226,15 +2227,30 @@ def search_youtube_endpoint():
                                     INSERT INTO visitor_reports 
                                     (visitor_id, search_query)
                                     VALUES (%s, %s)
+                                    RETURNING id
                                     """,
                                     (visitor_id, search_query)
                                 )
+                                report_id = cur.fetchone()[0]
                                 conn.commit()
+
+                                s3_key = f"visitor_reports/{report_id}"
+                                s3_client.put_object(
+                                    Bucket=bucket_name,
+                                    Key=s3_key,
+                                    Body=markdown_content,
+                                    ContentType='text/plain'
+                                )                                
                         except Exception as e:
                             logging.error(f"Error saving visitor report: {str(e)}")
                             # Continue even if saving fails
 
-                    return markdown_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+                    # Add report ID to response headers
+
+                    return jsonify({
+                        'id': str(report_id),
+                        'content': markdown_content,
+                    }), 200
                 else:
                     return jsonify({'error': 'Failed to generate report'}), 500
             
@@ -2541,6 +2557,195 @@ def get_visitor_reports():
 
     except Exception as e:
         logging.error(f"Database error checking visitor reports: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/get_public_report/<string:public_id>', methods=['GET'])
+def get_public_report(public_id):
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # First check the public_shared_reports table
+            cur.execute("""
+                SELECT user_report_id, visitor_report_id
+                FROM public_shared_reports 
+                WHERE id = %s
+            """, (public_id,))
+            
+            shared_report = cur.fetchone()
+            if not shared_report:
+                return jsonify({'error': 'Public report not found'}), 404
+
+            # Initialize variables
+            search_query = None
+            user_report_id = None
+            visitor_report_id = None
+            # Check which type of report it is and get the data
+            if shared_report['user_report_id']:
+                cur.execute("""
+                    SELECT id, search_query
+                    FROM user_reports 
+                    WHERE id = %s
+                """, (shared_report['user_report_id'],))
+                report = cur.fetchone()
+                if report:
+                    search_query = report['search_query']
+                    user_report_id = report['id']
+            elif shared_report['visitor_report_id']:
+                cur.execute("""
+                    SELECT id, search_query
+                    FROM visitor_reports 
+                    WHERE id = %s
+                """, (shared_report['visitor_report_id'],))
+                report = cur.fetchone()
+                if report:
+                    search_query = report['search_query']
+                    visitor_report_id = report['id']
+            
+            if not user_report_id and not visitor_report_id:
+                return jsonify({'error': 'Report data not found'}), 404
+
+            try:
+                # Get report content from S3
+
+                if user_report_id:
+                    s3_key = f"reports/{user_report_id}"
+                elif visitor_report_id:
+                    s3_key = f"visitor_reports/{visitor_report_id}"
+
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                )
+                bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                
+                s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                content = s3_response['Body'].read().decode('utf-8')
+                
+                # Create response with headers
+
+                return jsonify({
+                    'search_query': search_query,
+                    'content': content,
+                }), 200
+
+            except Exception as e:
+                logging.error(f"Error fetching report content from S3: {str(e)}")
+                return jsonify({'error': 'Failed to retrieve report content'}), 500
+
+    except Exception as e:
+        logging.error(f"Error in get_public_report: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/create_public_report', methods=['POST'])
+def create_public_report():
+    try:
+        data = request.json
+        report_id = data.get('report_id')
+        visitor_id = data.get('visitor_id')
+        
+        if not report_id:
+            return jsonify({'error': 'Report ID is required'}), 400
+
+        # Initialize variables
+        auth0_id = None
+        subscription_status = 'INACTIVE'
+
+        # Check for Bearer token
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+            try:
+                decoded_token = jwt.decode(
+                    token,
+                    auth0_validator.public_key,
+                    claims_options={
+                        "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                        "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                    }
+                )
+                auth0_id = decoded_token['sub']
+            except Exception as e:
+                logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
+                # Continue with visitor_id flow
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # If we have an auth0_id, check subscription status
+            if auth0_id:
+                cur.execute("""
+                    SELECT subscription_status 
+                    FROM users 
+                    WHERE auth0_id = %s
+                """, (auth0_id,))
+                result = cur.fetchone()
+                if result:
+                    subscription_status = result['subscription_status']
+
+            # Determine which type of report to look for based on subscription status
+            if subscription_status == 'ACTIVE':
+                cur.execute("""
+                    SELECT r.id 
+                    FROM user_reports r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE r.id = %s AND u.auth0_id = %s
+                """, (report_id, auth0_id))
+                is_visitor_report = False
+            else:
+                if not visitor_id:
+                    return jsonify({'error': 'Visitor ID is required'}), 400
+                cur.execute("""
+                    SELECT id 
+                    FROM visitor_reports 
+                    WHERE id = %s
+                """, (report_id,))
+                is_visitor_report = True
+
+            report = cur.fetchone()
+            if not report:
+                return jsonify({'error': 'Report not found'}), 404
+
+            # Check for existing public share
+            cur.execute("""
+                SELECT id
+                FROM public_shared_reports
+                WHERE user_report_id = %s OR visitor_report_id = %s
+            """, (
+                report_id if not is_visitor_report else None,
+                report_id if is_visitor_report else None
+            ))
+            
+            existing_share = cur.fetchone()
+            if existing_share:
+                return jsonify({
+                    'public_id': existing_share['id']
+                }), 200
+
+            # Create new public share entry if none exists
+            try:
+                cur.execute("""
+                    INSERT INTO public_shared_reports 
+                    (user_report_id, visitor_report_id, created_at)
+                    VALUES (%s, %s, NOW())
+                    RETURNING id
+                """, (
+                    None if is_visitor_report else report_id,
+                    report_id if is_visitor_report else None
+                ))
+                conn.commit()
+                
+                public_id = cur.fetchone()['id']
+                return jsonify({
+                    'public_id': public_id
+                }), 201
+
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Database error creating public share: {str(e)}")
+                return jsonify({'error': 'Failed to create public share'}), 500
+
+    except Exception as e:
+        logging.error(f"Error in create_public_report: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 
