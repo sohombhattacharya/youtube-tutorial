@@ -2246,10 +2246,11 @@ def search_youtube_endpoint():
                             # Continue even if saving fails
 
                     # Add report ID to response headers
-                    response = make_response(markdown_content)
-                    response.headers['Content-Type'] = 'text/plain; charset=utf-8'
-                    response.headers['X-Report-ID'] = str(report_id)
-                    return response, 200
+
+                    return jsonify({
+                        'id': str(report_id),
+                        'content': markdown_content,
+                    }), 200
                 else:
                     return jsonify({'error': 'Failed to generate report'}), 500
             
