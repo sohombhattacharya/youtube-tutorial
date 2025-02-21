@@ -113,13 +113,6 @@ CREATE TABLE public_shared_reports (
     user_report_id UUID REFERENCES user_reports(id),
     visitor_report_id UUID REFERENCES visitor_reports(id),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE public_shared_reports (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_report_id UUID REFERENCES user_reports(id),
-    visitor_report_id UUID REFERENCES visitor_reports(id),
-    created_at TIMESTAMP NOT NULL,
     CONSTRAINT one_report_type CHECK (
         (user_report_id IS NULL AND visitor_report_id IS NOT NULL) OR
         (user_report_id IS NOT NULL AND visitor_report_id IS NULL)
