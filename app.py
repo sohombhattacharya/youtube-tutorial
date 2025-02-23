@@ -73,6 +73,7 @@ from authlib.integrations.flask_oauth2 import ResourceProtector
 from authlib.jose import jwt  # Add this import at the top
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from groq import Groq
+from playwright.sync_api import sync_playwright
 
 
 
@@ -2760,191 +2761,100 @@ def create_public_report():
 
 def scrape_youtube_links(search_query):
     start_time = time.time()
-    options = webdriver.ChromeOptions()
-    options.add_argument('--headless')
-    
-    # Configure proxy with detailed logging
-    is_local = os.getenv('APP_ENV') == 'development'
-    if not is_local:
-        proxy = "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
-        logging.info(f"Setting up proxy configuration")
-        
-        # Try different proxy configurations
-        try:
-            # Test proxy connection before proceeding
-            import requests
-            test_response = requests.get('https://www.youtube.com', 
-                proxies={
-                    'http': proxy,
-                    'https': proxy
-                },
-                timeout=10
-            )
-            logging.info(f"Proxy test connection successful. Status: {test_response.status_code}")
-            
-            # If test successful, configure Chrome
-            options.add_argument(f'--proxy-server={proxy}')
-            
-            # Log the complete Chrome configuration
-            logging.info("Chrome proxy configuration complete")
-            
-        except Exception as e:
-            logging.error(f"Proxy test connection failed: {type(e).__name__}: {str(e)}")
-            # Continue without proxy as fallback
-            logging.warning("Continuing without proxy configuration")
-    
-    # Log all Chrome options for debugging
-    logging.info("Chrome options:")
-    for arg in options.arguments:
-        # Remove sensitive info before logging
-        safe_arg = arg.replace('spclyk9gey:2Oujegb7i53~YORtoe', '***:***') if 'spclyk9gey' in arg else arg
-        logging.info(f"  {safe_arg}")
-    
-    # Additional options for stability
-    options.add_argument('--disable-gpu')
-    options.add_argument('--disable-extensions')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-infobars')
-    options.add_argument('--disable-notifications')
-    options.add_argument('--disable-popup-blocking')
-    options.page_load_strategy = 'eager'
-    
-    driver = None
     results = []
     
     try:
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(15)  # Increased timeout
-        
-        # Encode search query for URL
-        encoded_query = urllib.parse.quote(search_query)
-        url = f"https://www.youtube.com/results?search_query={encoded_query}"
-        
-        # Multiple attempts to load the page
-        max_attempts = 1
-        for attempt in range(max_attempts):
-            try:
-                driver.get(url)
-                break
-            except TimeoutException:
-                if attempt == max_attempts - 1:
-                    logging.error(f"Failed to load YouTube after {max_attempts} attempts")
-                    return []
-                logging.warning(f"Timeout on attempt {attempt + 1}, retrying...")
-                driver.refresh()
-        
-        logging.info("Page retrieved")
-
-
-        # Wait for initial content load with multiple selectors
-        wait = WebDriverWait(driver, 15)
-        try:
-            logging.info("Initial content load complete")
-            # Try different selectors in case YouTube's structure changes
-            selectors = [
-                "a#video-title",
-                "ytd-video-renderer",
-                "#contents ytd-video-renderer"
-            ]
-
-            ## upload page source to s3
-            logging.info("Uploading page source to s3")
-            s3_client = boto3.client(
-                's3',
-                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+        with sync_playwright() as p:
+            # Configure browser
+            is_local = os.getenv('APP_ENV') == 'development'
+            browser_args = ['--headless=new']
+            
+            if not is_local:
+                proxy = {
+                    "server": "http://gate.smartproxy.com:10001",
+                    "username": "spclyk9gey",
+                    "password": "2Oujegb7i53~YORtoe"
+                }
+                browser = p.chromium.launch(
+                    proxy=proxy,
+                    args=browser_args
+                )
+            else:
+                browser = p.chromium.launch(args=browser_args)
+            
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
             )
-            bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
-            s3_key = f"youtube_page_source/{search_query}.html"
-            s3_client.put_object(
-                Bucket=bucket_name,
-                Key=s3_key,
-                Body=driver.page_source,
-                ContentType='text/html'
-            )
-            logging.info("Page source uploaded to s3")
-
-            for selector in selectors:
-                try:
-                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                    break
-                except TimeoutException:
-                    continue
             
-            logging.info("Waiting for scroll")
-            # Scroll with error handling
-            scroll_attempts = 3
-            last_height = driver.execute_script("return document.documentElement.scrollHeight")
+            page = context.new_page()
             
-            for _ in range(scroll_attempts):
-                try:
-                    driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-                    time.sleep(1.5)  # Slightly increased wait time
-                    
-                    new_height = driver.execute_script("return document.documentElement.scrollHeight")
-                    if new_height == last_height:
-                        break
-                    last_height = new_height
-                except Exception as e:
-                    logging.warning(f"Scroll error (non-critical): {str(e)}")
-                    break
+            # Navigate to YouTube search
+            encoded_query = urllib.parse.quote(search_query)
+            url = f"https://www.youtube.com/results?search_query={encoded_query}"
             
-            logging.info("Page loaded, looking for video elements")
-
-
-            # Try multiple methods to find video elements
-            video_elements = []
-            for selector in selectors:
-                try:
-                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                    if elements:
-                        logging.info(f"Found {len(elements)} elements matching selector: {selector}")
-                        video_elements = elements
-                        break
-                except Exception:
-                    continue
+            logging.info(f"Navigating to {url}")
+            page.goto(url, wait_until="networkidle")
             
-            # Extract video information with better error handling
-            for element in video_elements[:25]:
+            # Wait for video results to load
+            page.wait_for_selector("ytd-video-renderer", timeout=15000)
+            
+            # Scroll to load more results
+            for _ in range(3):
+                page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+                page.wait_for_timeout(1500)  # Wait for content to load
+            
+            # Extract video information
+            video_elements = page.query_selector_all("ytd-video-renderer")[:25]
+            
+            for element in video_elements:
                 try:
-                    href = element.get_attribute('href')
-                    title = element.get_attribute('title')
-                    
-                    # Additional check for empty or invalid values
-                    if not href or not title:
+                    title_element = element.query_selector("#video-title")
+                    if not title_element:
                         continue
                         
-                    if 'watch?v=' in href:
-                        results.append((href, title))
+                    href = title_element.get_attribute("href")
+                    title = title_element.get_attribute("title")
+                    
+                    if href and title and 'watch?v=' in href:
+                        full_url = f"https://www.youtube.com{href}"
+                        results.append((full_url, title))
+                        
                 except Exception as e:
                     logging.warning(f"Error extracting video details: {str(e)}")
                     continue
-                
-            if not results:
-                logging.error("No valid video results found")
-                return []
             
-        except TimeoutException as e:
-            logging.error(f"Timeout waiting for video elements: {str(e)}")
-            return []
-        except Exception as e:
-            logging.error(f"Error finding video elements: {str(e)}")
-            return []
+            # Upload page source to S3 for debugging
+            try:
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                )
+                bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                s3_key = f"youtube_page_source/{search_query}.html"
+                
+                page_content = page.content()
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=s3_key,
+                    Body=page_content,
+                    ContentType='text/html'
+                )
+                logging.info("Page source uploaded to S3")
+            except Exception as e:
+                logging.error(f"Error uploading page source to S3: {str(e)}")
+            
+            # Clean up
+            context.close()
+            browser.close()
             
     except Exception as e:
-        logging.error(f"General error in scrape_youtube_links: {str(e)}")
-        return []
+        logging.error(f"Error in scrape_youtube_links: {type(e).__name__}: {str(e)}")
+        return [], time.time() - start_time
         
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception as e:
-                logging.warning(f"Error closing browser: {str(e)}")
-        
-        end_time = time.time()
-        return results, end_time - start_time
+    end_time = time.time()
+    return results, end_time - start_time
 
 def process_video(video):
     """Helper function to process a single video and get its tutorial"""
