@@ -2785,7 +2785,7 @@ def scrape_youtube_links(search_query):
         driver.get(f"https://www.youtube.com/results?search_query={search_query}")
         
         # Wait for initial load with explicit wait
-        wait = WebDriverWait(driver, 10)
+        wait = WebDriverWait(driver, 20)
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         
         # Reduce scroll iterations and wait time
