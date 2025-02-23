@@ -2892,6 +2892,9 @@ def process_video(video):
 
 @app.route('/search_youtube_v2_test', methods=['GET'])
 def search_youtube_endpoint_v2_test():
+    internal_api_key = request.args.get('internal_api_key')
+    if internal_api_key != os.getenv('INTERNAL_API_KEY'):
+        return jsonify({'error': 'Invalid API key'}), 401
     try:
         search_query = request.args.get('search', '').strip()
         timing_info = {}
