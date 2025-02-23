@@ -227,14 +227,14 @@ def generate_tutorial(transcript_data, youtube_url):
     else:
         return 'No tutorial generated.'
 
-def transcribe_youtube_video(video_id, youtube_url):
+def transcribe_youtube_video(video_id, youtube_url, rotate_proxy=False):
     # Determine if running locally using the environment variable
     is_local = os.getenv('APP_ENV') == 'development'
 
     # Set proxies only if not running locally
     proxies = None if is_local else {
-        'http': "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001",
-        'https': "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
+        'http': "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:7000" if rotate_proxy else "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001",
+        'https': "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:7000" if rotate_proxy else "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
     }
     
     # Fetch the transcript for the given video ID
@@ -2765,7 +2765,7 @@ def scrape_youtube_links(search_query):
     
     # Configure proxy with detailed logging
     is_local = os.getenv('APP_ENV') == 'development'
-    if is_local:
+    if not is_local:
         proxy = "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
         logging.info(f"Setting up proxy configuration")
         
@@ -2946,7 +2946,7 @@ def process_video(video):
             tutorial = s3_response['Body'].read().decode('utf-8')
         except s3_client.exceptions.NoSuchKey:
             # Generate new tutorial if not found
-            tutorial = transcribe_youtube_video(video_id, video_url)
+            tutorial = transcribe_youtube_video(video_id, video_url, rotate_proxy=True)
 
             s3_client.put_object(
                 Bucket=bucket_name,
