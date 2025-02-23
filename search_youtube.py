@@ -10,15 +10,6 @@ def get_youtube_links(search_query):
     options = webdriver.ChromeOptions()
     options.add_argument('--headless')
     
-    # SmartProxy configuration
-    SMARTPROXY_USERNAME = "your_username"  # Replace with your SmartProxy username
-    SMARTPROXY_PASSWORD = "your_password"  # Replace with your SmartProxy password
-    SMARTPROXY_ENDPOINT = "gate.smartproxy.com:7000"  # Replace with your endpoint
-    
-    # Configure proxy
-    proxy = f"http://{SMARTPROXY_USERNAME}:{SMARTPROXY_PASSWORD}@{SMARTPROXY_ENDPOINT}"
-    options.add_argument(f'--proxy-server={proxy}')
-    
     # Existing performance optimizations
     options.add_argument('--disable-gpu')
     options.add_argument('--disable-extensions')

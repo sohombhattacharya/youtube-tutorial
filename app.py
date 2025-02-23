@@ -2894,7 +2894,6 @@ def process_video(video):
 def search_youtube_endpoint_v2_test():
     try:
         search_query = request.args.get('search', '').strip()
-        use_groq = request.args.get('use_groq', 'false').lower() == 'true'
         timing_info = {}
         
         # Time the YouTube scraping
@@ -2903,14 +2902,19 @@ def search_youtube_endpoint_v2_test():
         
         # Process videos in parallel batches
         all_tutorials = []
-        batch_size = 10
+        batch_size = 25
         batch_times = []
         
+        # Calculate number of batches needed
+        num_batches = (len(videos) + batch_size - 1) // batch_size
+        
         # Process videos in batches
-        for i in range(0, len(videos), batch_size):
+        for batch_num in range(num_batches):
             batch_start = time.time()
-            batch = videos[i:i + batch_size]
-            
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, len(videos))  # Ensure we don't go past the end
+            batch = videos[start_idx:end_idx]
+
             # Process batch in parallel
             with ThreadPoolExecutor(max_workers=batch_size) as executor:
                 future_to_video = {executor.submit(process_video, video): video for video in batch}
@@ -2921,8 +2925,7 @@ def search_youtube_endpoint_v2_test():
                         all_tutorials.append(result)
             
             batch_end = time.time()
-            batch_num = (i // batch_size) + 1
-            batch_times.append((batch_num, batch_end - batch_start))
+            batch_times.append((batch_num + 1, batch_end - batch_start))
 
         # Add batch times to timing info
         for batch_num, batch_time in batch_times:
@@ -2982,25 +2985,12 @@ def search_youtube_endpoint_v2_test():
                 "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
             )
             
-            # Generate the report using either Gemini or Groq
-            if use_groq:
-                groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-                completion = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant that analyzes content and creates detailed reports."},
-                        {"role": "user", "content": prompt}
-                    ],
-                )
-                response_text = completion.choices[0].message.content
-            else:
-                model = genai.GenerativeModel("gemini-2.0-flash")
-                response = model.generate_content(prompt)
-                response_text = response.text if response else None
+            model = genai.GenerativeModel("gemini-2.0-flash-lite-preview-02-05")
+            response = model.generate_content(prompt)
+            response_text = response.text if response else None
             
             llm_time = time.time() - llm_start
             timing_info['llm_generation'] = f"{llm_time:.2f} seconds"
-            timing_info['llm_model'] = "Groq LLaMA-3" if use_groq else "Gemini"
             
             if response_text:
                 # Get environment and base URL
@@ -3065,8 +3055,6 @@ def search_youtube_endpoint_v2_test():
                     return jsonify({
                         'content': markdown_content,
                         'timing': timing_info,
-                        'total_time': f"{sum(float(time.split()[0]) for time in timing_info.values()):.2f} seconds",
-                        'model_used': "Groq LLaMA-3" if use_groq else "Gemini"
                     }), 200
                 else:
                     return jsonify({'error': 'Failed to generate report'}), 500
