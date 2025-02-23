@@ -2834,6 +2834,8 @@ def scrape_youtube_links(search_query):
                 logging.warning(f"Timeout on attempt {attempt + 1}, retrying...")
                 driver.refresh()
         
+        logging.info("Page title: " + driver.title)
+
         # Wait for initial content load with multiple selectors
         wait = WebDriverWait(driver, 15)
         try:
@@ -2843,7 +2845,22 @@ def scrape_youtube_links(search_query):
                 "ytd-video-renderer",
                 "#contents ytd-video-renderer"
             ]
-            
+
+            ## upload page source to s3
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+            )
+            bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+            s3_key = f"youtube_page_source/{search_query}.html"
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=driver.page_source,
+                ContentType='text/html'
+            )
+
             for selector in selectors:
                 try:
                     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
