@@ -2763,11 +2763,42 @@ def scrape_youtube_links(search_query):
     options = webdriver.ChromeOptions()
     options.add_argument('--headless')
     
-    # Configure proxy
+    # Configure proxy with detailed logging
     is_local = os.getenv('APP_ENV') == 'development'
-    if not is_local:
+    if is_local:
         proxy = "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
-        options.add_argument(f'--proxy-server={proxy}')
+        logging.info(f"Setting up proxy configuration")
+        
+        # Try different proxy configurations
+        try:
+            # Test proxy connection before proceeding
+            import requests
+            test_response = requests.get('https://www.youtube.com', 
+                proxies={
+                    'http': proxy,
+                    'https': proxy
+                },
+                timeout=10
+            )
+            logging.info(f"Proxy test connection successful. Status: {test_response.status_code}")
+            
+            # If test successful, configure Chrome
+            options.add_argument(f'--proxy-server={proxy}')
+            
+            # Log the complete Chrome configuration
+            logging.info("Chrome proxy configuration complete")
+            
+        except Exception as e:
+            logging.error(f"Proxy test connection failed: {type(e).__name__}: {str(e)}")
+            # Continue without proxy as fallback
+            logging.warning("Continuing without proxy configuration")
+    
+    # Log all Chrome options for debugging
+    logging.info("Chrome options:")
+    for arg in options.arguments:
+        # Remove sensitive info before logging
+        safe_arg = arg.replace('spclyk9gey:2Oujegb7i53~YORtoe', '***:***') if 'spclyk9gey' in arg else arg
+        logging.info(f"  {safe_arg}")
     
     # Additional options for stability
     options.add_argument('--disable-gpu')
