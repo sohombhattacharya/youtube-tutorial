@@ -6,43 +6,49 @@ from selenium.webdriver.support import expected_conditions as EC
 import time
 
 def get_youtube_links(search_query):
-    # Set up Chrome driver in headless mode
+    start_time = time.time()
     options = webdriver.ChromeOptions()
     options.add_argument('--headless')
+    
+    # SmartProxy configuration
+    SMARTPROXY_USERNAME = "your_username"  # Replace with your SmartProxy username
+    SMARTPROXY_PASSWORD = "your_password"  # Replace with your SmartProxy password
+    SMARTPROXY_ENDPOINT = "gate.smartproxy.com:7000"  # Replace with your endpoint
+    
+    # Configure proxy
+    proxy = f"http://{SMARTPROXY_USERNAME}:{SMARTPROXY_PASSWORD}@{SMARTPROXY_ENDPOINT}"
+    options.add_argument(f'--proxy-server={proxy}')
+    
+    # Existing performance optimizations
+    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-extensions')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.page_load_strategy = 'eager'
+    
     driver = webdriver.Chrome(options=options)
     
     try:
-        # Navigate to YouTube
-        driver.get("https://www.youtube.com")
+        # Navigate directly to search results instead of homepage
+        driver.get(f"https://www.youtube.com/results?search_query={search_query}")
         
-        # Wait for and find the search box
-        search_box = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.NAME, "search_query"))
-        )
-        
-        # Enter search query and submit
-        search_box.send_keys(search_query)
-        search_box.send_keys(Keys.RETURN)
-        
-        # Wait for results to load
-        time.sleep(3)
-        
-        # Scroll down to load more videos
-        for _ in range(3):
+        # Reduce scroll iterations and wait time
+        for _ in range(2):  # Reduced from 3 to 2
             driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-            time.sleep(2)
+            time.sleep(1)  # Reduced from 2 to 1
         
-        # Find all video links
-        video_links = WebDriverWait(driver, 10).until(
+        # Find all video links and titles
+        video_elements = WebDriverWait(driver, 5).until(  # Reduced timeout from 10 to 5
             EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a#video-title"))
         )
         
-        # Extract and return the first 25 links
+        # Extract and return the first 25 links and titles
         results = []
-        for link in video_links[:25]:
-            href = link.get_attribute('href')
+        for element in video_elements[:25]:
+            href = element.get_attribute('href')
+            title = element.get_attribute('title')
             if href and 'watch?v=' in href:
-                results.append(href)
+                results.append((href, title))
         
         return results
     
@@ -53,8 +59,11 @@ def get_youtube_links(search_query):
 # Example usage
 if __name__ == "__main__":
     search_term = input("Enter your YouTube search query: ")
-    links = get_youtube_links(search_term)
+    start_time = time.time()  # Add timer start
+    video_info = get_youtube_links(search_term)
+    end_time = time.time()  # Add timer end
     
-    print("\nFirst 25 YouTube video links:")
-    for i, link in enumerate(links, 1):
-        print(f"{i}. {link}")
+    print(f"\nSearch completed in {end_time - start_time:.2f} seconds")
+    print("\nFirst 25 YouTube videos:")
+    for i, (link, title) in enumerate(video_info, 1):
+        print(f"{i}. {title}\n   {link}\n")

@@ -7,6 +7,12 @@ import io
 import zipfile
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 # Configure logging - must be first!
 log_level = logging.DEBUG if os.getenv('APP_ENV') == 'development' else logging.INFO
@@ -64,6 +70,8 @@ import certifi
 import requests
 from authlib.integrations.flask_oauth2 import ResourceProtector
 from authlib.jose import jwt  # Add this import at the top
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from groq import Groq
 
 
 
@@ -2749,7 +2757,323 @@ def create_public_report():
         return jsonify({'error': 'Internal server error'}), 500
 
 
+def scrape_youtube_links(search_query):
+    start_time = time.time()
+    options = webdriver.ChromeOptions()
+    options.add_argument('--headless')
+    
+    # Configure proxy
+    is_local = os.getenv('APP_ENV') == 'development'
+    if not is_local:
+        proxy = "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
+        options.add_argument(f'--proxy-server={proxy}')
+    
+    # Existing performance optimizations
+    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-extensions')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.page_load_strategy = 'eager'
+    
+    driver = webdriver.Chrome(options=options)
+    
+    try:
+        # Set page load timeout
+        driver.set_page_load_timeout(10)
+        
+        # Navigate directly to search results instead of homepage
+        driver.get(f"https://www.youtube.com/results?search_query={search_query}")
+        
+        # Wait for initial load with explicit wait
+        wait = WebDriverWait(driver, 10)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        
+        # Reduce scroll iterations and wait time
+        for _ in range(2):  # Reduced from 3 to 2
+            try:
+                driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
+                time.sleep(1)  # Reduced from 2 to 1
+            except Exception as e:
+                logging.warning(f"Scroll error (non-critical): {str(e)}")
+                break
+        
+        try:
+            # Find all video links and titles with explicit wait
+            video_elements = wait.until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a#video-title"))
+            )
+            
+            # Extract and return the first 25 links and titles
+            results = []
+            for element in video_elements[:25]:
+                try:
+                    href = element.get_attribute('href')
+                    title = element.get_attribute('title')
+                    if href and 'watch?v=' in href:
+                        results.append((href, title))
+                except Exception as e:
+                    logging.warning(f"Error extracting video details (non-critical): {str(e)}")
+                    continue
+            
+            if not results:
+                logging.error("No video results found")
+                return []
+                
+            return results
+            
+        except TimeoutException:
+            logging.error("Timeout waiting for video elements")
+            return []
+        except Exception as e:
+            logging.error(f"Error finding video elements: {str(e)}")
+            return []
+    
+    except TimeoutException:
+        logging.error("Timeout loading YouTube search page")
+        return []
+    except Exception as e:
+        logging.error(f"Error in scrape_youtube_links: {str(e)}")
+        return []
+    
+    finally:
+        try:
+            # Close the browser
+            driver.quit()
+        except Exception as e:
+            logging.warning(f"Error closing browser (non-critical): {str(e)}")
+        
+        end_time = time.time()
+        return results, end_time - start_time
 
+def process_video(video):
+    """Helper function to process a single video and get its tutorial"""
+    try:
+        video_url = video[0]  # URL is first element in tuple
+        video_title = video[1]  # Title is second element in tuple
+        
+        # Extract video ID from URL
+        video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
+        if not video_id_match:
+            return None
+        video_id = video_id_match.group(1)
+        
+        # Check if tutorial exists in S3
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+        )
+        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+        s3_key = f"notes/{video_id}"
+        
+        try:
+            s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+            tutorial = s3_response['Body'].read().decode('utf-8')
+        except s3_client.exceptions.NoSuchKey:
+            # Generate new tutorial if not found
+            tutorial = transcribe_youtube_video(video_id, video_url)
+
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=tutorial,
+                ContentType='text/plain'
+            )
+        
+        return {
+            'title': video_title,
+            'url': video_url,
+            'content': tutorial
+        }
+        
+    except Exception as e:
+        logging.error(f"Error processing video {video_url}: {str(e)}")
+        return None
+
+@app.route('/search_youtube_v2_test', methods=['GET'])
+def search_youtube_endpoint_v2_test():
+    try:
+        search_query = request.args.get('search', '').strip()
+        use_groq = request.args.get('use_groq', 'false').lower() == 'true'
+        timing_info = {}
+        
+        # Time the YouTube scraping
+        videos, scrape_time = scrape_youtube_links(search_query)
+        timing_info['youtube_scraping'] = f"{scrape_time:.2f} seconds"
+        
+        # Process videos in parallel batches
+        all_tutorials = []
+        batch_size = 10
+        batch_times = []
+        
+        # Process videos in batches
+        for i in range(0, len(videos), batch_size):
+            batch_start = time.time()
+            batch = videos[i:i + batch_size]
+            
+            # Process batch in parallel
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                future_to_video = {executor.submit(process_video, video): video for video in batch}
+                
+                for future in as_completed(future_to_video):
+                    result = future.result()
+                    if result:
+                        all_tutorials.append(result)
+            
+            batch_end = time.time()
+            batch_num = (i // batch_size) + 1
+            batch_times.append((batch_num, batch_end - batch_start))
+
+        # Add batch times to timing info
+        for batch_num, batch_time in batch_times:
+            timing_info[f'batch_{batch_num}_processing'] = f"{batch_time:.2f} seconds"
+
+        # Generate comprehensive report using selected LLM
+        if all_tutorials:
+            llm_start = time.time()
+            prompt = (
+                "# Analysis Task\n\n"
+                f"## User Query\n{search_query}\n\n"
+                "## Task Overview\n"
+                "1. First, analyze the user's query to understand:\n"
+                "   - Is this a specific question seeking direct answers?\n"
+                "   - Is this a broad topic requiring synthesis and exploration?\n"
+                "   - What are the key aspects or dimensions that need to be addressed?\n"
+                "   - What would be most valuable to the user based on their query?\n"
+                "   - What deeper implications or connections should be explored?\n\n"
+                "2. Then, without mentioning the type of the user's query, and without mentioning that this is an analysis of video transcripts, structure your response appropriately based on the query type. For example:\n"
+                "   - For specific questions: Provide comprehensive answers with in-depth analysis and multiple perspectives\n"
+                "   - For broad topics: Deliver thorough synthesis with detailed exploration of key themes\n"
+                "   - For comparisons: Examine nuanced differences and complex trade-offs\n"
+                "   - For how-to queries: Include detailed methodology and consideration of edge cases\n\n"
+                "## Content Guidelines\n"
+                " - Create a title for the report that is a summary of the report\n"
+                "- Structure the response in the most logical way for this specific query\n"
+                "- Deeply analyze different perspectives and approaches\n"
+                "- Highlight both obvious and subtle connections between sources\n"
+                "- Examine any contradictions or disagreements in detail\n"
+                "- Draw meaningful conclusions that directly relate to the query\n"
+                "- Consider practical implications and real-world applications\n"
+                "- Explore edge cases and potential limitations\n"
+                "- Identify patterns and trends across sources\n\n"
+                "## Citation and Reference Guidelines\n"
+                "- Include timestamp links whenever referencing specific content\n"
+                "- Add timestamps for:\n"
+                "  * Direct quotes or key statements\n"
+                "  * Important examples or demonstrations\n"
+                "  * Technical explanations or tutorials\n"
+                "  * Expert opinions or insights\n"
+                "  * Supporting evidence for major claims\n"
+                "  * Contrasting viewpoints or approaches\n"
+                "- Format timestamps as markdown links to specific moments in the videos\n"
+                "- Integrate timestamps naturally into the text to maintain readability\n"
+                "- Use multiple timestamps when a point is supported across different sources\n\n"
+                "## Formatting Requirements\n"
+                "- Use proper markdown headers (# for main title, ## for sections)\n"
+                "- Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "- Format quotes with > for blockquotes\n"
+                "- Use **bold** for emphasis\n"
+                "- Ensure all newlines are proper markdown line breaks\n"
+                "- Format timestamps as [MM:SS](video-link) or similar\n\n"
+                "## Source Materials\n"
+                f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
+                "Analyze these materials thoroughly to provide a detailed, well-reasoned response that best serves the user's needs. "
+                "Don't summarize - dig deep into the content and explore all relevant aspects and implications. "
+                "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
+            )
+            
+            # Generate the report using either Gemini or Groq
+            if use_groq:
+                groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+                completion = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that analyzes content and creates detailed reports."},
+                        {"role": "user", "content": prompt}
+                    ],
+                )
+                response_text = completion.choices[0].message.content
+            else:
+                model = genai.GenerativeModel("gemini-2.0-flash")
+                response = model.generate_content(prompt)
+                response_text = response.text if response else None
+            
+            llm_time = time.time() - llm_start
+            timing_info['llm_generation'] = f"{llm_time:.2f} seconds"
+            timing_info['llm_model'] = "Groq LLaMA-3" if use_groq else "Gemini"
+            
+            if response_text:
+                # Get environment and base URL
+                is_dev = os.getenv('APP_ENV') == 'development'
+                base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
+                
+                # Create a mapping of video IDs to source numbers
+                video_id_to_source = {}
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        video_id_to_source[video_id] = i
+
+                # Update timestamp hyperlinks with source numbers
+                def add_source_number(match):
+                    url = match.group(0)
+                    
+                    # Only process links that are actual YouTube timestamp links
+                    if not ('youtu.be' in url and '?t=' in url):
+                        return url
+                        
+                    video_id_match = re.search(r'youtu\.be/([0-9A-Za-z_-]{11})', url)
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        source_num = video_id_to_source.get(video_id)
+                        if source_num:
+                            # Extract the display text (time) from the markdown link
+                            display_text_match = re.search(r'\[(.*?)\]', url)
+                            if not display_text_match:
+                                return url
+                            display_text = display_text_match.group(1)
+                            
+                            # Extract the URL part from the markdown link
+                            url_match = re.search(r'\((.*?)\)', url)
+                            if not url_match:
+                                return url
+                            url_part = url_match.group(1)
+                            
+                            # Verify this is a valid timestamp link before formatting
+                            if display_text and url_part and 'youtu.be' in url_part and '?t=' in url_part:
+                                return f'[({source_num}) {display_text}]({url_part})'
+                        return url
+                    return url
+
+                # Update the regex pattern to only match YouTube timestamp links
+                markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
+
+                # Add the sources section
+                markdown_content += "\n\n## Sources\n"
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        note_url = f"{base_url}/?v={video_id}"
+                        markdown_content += f"{i}. [{tutorial['title']}]({note_url})\n"
+                    else:
+                        markdown_content += f"{i}. [{tutorial['title']}]({tutorial['url']})\n"
+
+                # After generating the markdown content, handle differently for auth vs visitor
+                if markdown_content:
+                    return jsonify({
+                        'content': markdown_content,
+                        'timing': timing_info,
+                        'total_time': f"{sum(float(time.split()[0]) for time in timing_info.values()):.2f} seconds",
+                        'model_used': "Groq LLaMA-3" if use_groq else "Gemini"
+                    }), 200
+                else:
+                    return jsonify({'error': 'Failed to generate report'}), 500
+            
+    except Exception as e:
+        logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
