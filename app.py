@@ -13,6 +13,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+import urllib.parse
 
 # Configure logging - must be first!
 log_level = logging.DEBUG if os.getenv('APP_ENV') == 'development' else logging.INFO
@@ -2768,79 +2769,122 @@ def scrape_youtube_links(search_query):
         proxy = "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
         options.add_argument(f'--proxy-server={proxy}')
     
-    # Existing performance optimizations
+    # Additional options for stability
     options.add_argument('--disable-gpu')
     options.add_argument('--disable-extensions')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-infobars')
+    options.add_argument('--disable-notifications')
+    options.add_argument('--disable-popup-blocking')
     options.page_load_strategy = 'eager'
     
-    driver = webdriver.Chrome(options=options)
+    driver = None
+    results = []
     
     try:
-        # Set page load timeout
-        driver.set_page_load_timeout(10)
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(15)  # Increased timeout
         
-        # Navigate directly to search results instead of homepage
-        driver.get(f"https://www.youtube.com/results?search_query={search_query}")
+        # Encode search query for URL
+        encoded_query = urllib.parse.quote(search_query)
+        url = f"https://www.youtube.com/results?search_query={encoded_query}"
         
-        # Wait for initial load with explicit wait
-        wait = WebDriverWait(driver, 20)
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        
-        # Reduce scroll iterations and wait time
-        for _ in range(2):  # Reduced from 3 to 2
+        # Multiple attempts to load the page
+        max_attempts = 3
+        for attempt in range(max_attempts):
             try:
-                driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-                time.sleep(1)  # Reduced from 2 to 1
-            except Exception as e:
-                logging.warning(f"Scroll error (non-critical): {str(e)}")
+                driver.get(url)
                 break
+            except TimeoutException:
+                if attempt == max_attempts - 1:
+                    logging.error(f"Failed to load YouTube after {max_attempts} attempts")
+                    return []
+                logging.warning(f"Timeout on attempt {attempt + 1}, retrying...")
+                driver.refresh()
         
+        # Wait for initial content load with multiple selectors
+        wait = WebDriverWait(driver, 15)
         try:
-            # Find all video links and titles with explicit wait
-            video_elements = wait.until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a#video-title"))
-            )
+            # Try different selectors in case YouTube's structure changes
+            selectors = [
+                "a#video-title",
+                "ytd-video-renderer",
+                "#contents ytd-video-renderer"
+            ]
             
-            # Extract and return the first 25 links and titles
-            results = []
+            for selector in selectors:
+                try:
+                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+                    break
+                except TimeoutException:
+                    continue
+            
+            # Scroll with error handling
+            scroll_attempts = 3
+            last_height = driver.execute_script("return document.documentElement.scrollHeight")
+            
+            for _ in range(scroll_attempts):
+                try:
+                    driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
+                    time.sleep(1.5)  # Slightly increased wait time
+                    
+                    new_height = driver.execute_script("return document.documentElement.scrollHeight")
+                    if new_height == last_height:
+                        break
+                    last_height = new_height
+                except Exception as e:
+                    logging.warning(f"Scroll error (non-critical): {str(e)}")
+                    break
+            
+            # Try multiple methods to find video elements
+            video_elements = []
+            for selector in selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements:
+                        video_elements = elements
+                        break
+                except Exception:
+                    continue
+            
+            # Extract video information with better error handling
             for element in video_elements[:25]:
                 try:
                     href = element.get_attribute('href')
                     title = element.get_attribute('title')
-                    if href and 'watch?v=' in href:
+                    
+                    # Additional check for empty or invalid values
+                    if not href or not title:
+                        continue
+                        
+                    if 'watch?v=' in href:
                         results.append((href, title))
                 except Exception as e:
-                    logging.warning(f"Error extracting video details (non-critical): {str(e)}")
+                    logging.warning(f"Error extracting video details: {str(e)}")
                     continue
-            
-            if not results:
-                logging.error("No video results found")
-                return []
                 
-            return results
+            if not results:
+                logging.error("No valid video results found")
+                return []
             
-        except TimeoutException:
-            logging.error("Timeout waiting for video elements")
+        except TimeoutException as e:
+            logging.error(f"Timeout waiting for video elements: {str(e)}")
             return []
         except Exception as e:
             logging.error(f"Error finding video elements: {str(e)}")
             return []
-    
-    except TimeoutException:
-        logging.error("Timeout loading YouTube search page")
-        return []
+            
     except Exception as e:
-        logging.error(f"Error in scrape_youtube_links: {str(e)}")
+        logging.error(f"General error in scrape_youtube_links: {str(e)}")
         return []
-    
+        
     finally:
-        try:
-            # Close the browser
-            driver.quit()
-        except Exception as e:
-            logging.warning(f"Error closing browser (non-critical): {str(e)}")
+        if driver:
+            try:
+                driver.quit()
+            except Exception as e:
+                logging.warning(f"Error closing browser: {str(e)}")
         
         end_time = time.time()
         return results, end_time - start_time
