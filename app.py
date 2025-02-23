@@ -2834,11 +2834,13 @@ def scrape_youtube_links(search_query):
                 logging.warning(f"Timeout on attempt {attempt + 1}, retrying...")
                 driver.refresh()
         
-        logging.info("Page title: " + driver.title)
+        logging.info("Page retrieved")
+
 
         # Wait for initial content load with multiple selectors
         wait = WebDriverWait(driver, 15)
         try:
+            logging.info("Initial content load complete")
             # Try different selectors in case YouTube's structure changes
             selectors = [
                 "a#video-title",
@@ -2847,6 +2849,7 @@ def scrape_youtube_links(search_query):
             ]
 
             ## upload page source to s3
+            logging.info("Uploading page source to s3")
             s3_client = boto3.client(
                 's3',
                 aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -2860,6 +2863,7 @@ def scrape_youtube_links(search_query):
                 Body=driver.page_source,
                 ContentType='text/html'
             )
+            logging.info("Page source uploaded to s3")
 
             for selector in selectors:
                 try:
@@ -2868,6 +2872,7 @@ def scrape_youtube_links(search_query):
                 except TimeoutException:
                     continue
             
+            logging.info("Waiting for scroll")
             # Scroll with error handling
             scroll_attempts = 3
             last_height = driver.execute_script("return document.documentElement.scrollHeight")
