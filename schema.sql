@@ -91,5 +91,30 @@ CREATE TABLE user_reports (
 CREATE TABLE visitor_reports (
     visitor_id TEXT NOT NULL,  
     search_query TEXT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- Add the new ID column
+ALTER TABLE visitor_reports ADD COLUMN id UUID DEFAULT gen_random_uuid();
+
+-- Backfill the column with new UUIDs
+UPDATE visitor_reports SET id = gen_random_uuid();
+
+-- Make the column NOT NULL after backfilling
+ALTER TABLE visitor_reports ALTER COLUMN id SET NOT NULL;
+
+-- Add the primary key constraint
+ALTER TABLE visitor_reports ADD PRIMARY KEY (id);
+
+
+CREATE TABLE public_shared_reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_report_id UUID REFERENCES user_reports(id),
+    visitor_report_id UUID REFERENCES visitor_reports(id),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    CONSTRAINT one_report_type CHECK (
+        (user_report_id IS NULL AND visitor_report_id IS NOT NULL) OR
+        (user_report_id IS NOT NULL AND visitor_report_id IS NULL)
+    )
 );
