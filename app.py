@@ -16,7 +16,7 @@ from selenium.common.exceptions import TimeoutException
 import urllib.parse
 
 # Configure logging - must be first!
-log_level = logging.DEBUG if os.getenv('APP_ENV') == 'development' else logging.INFO
+log_level = logging.INFO if os.getenv('APP_ENV') == 'development' else logging.INFO
 
 # Custom filter to exclude OPTIONS and POST requests
 class HTTPFilter(logging.Filter):
@@ -2822,7 +2822,7 @@ def scrape_youtube_links(search_query):
         url = f"https://www.youtube.com/results?search_query={encoded_query}"
         
         # Multiple attempts to load the page
-        max_attempts = 3
+        max_attempts = 1
         for attempt in range(max_attempts):
             try:
                 driver.get(url)
@@ -2868,12 +2868,16 @@ def scrape_youtube_links(search_query):
                     logging.warning(f"Scroll error (non-critical): {str(e)}")
                     break
             
+            logging.info("Page loaded, looking for video elements")
+
+
             # Try multiple methods to find video elements
             video_elements = []
             for selector in selectors:
                 try:
                     elements = driver.find_elements(By.CSS_SELECTOR, selector)
                     if elements:
+                        logging.info(f"Found {len(elements)} elements matching selector: {selector}")
                         video_elements = elements
                         break
                 except Exception:
