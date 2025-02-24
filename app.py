@@ -14,6 +14,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import urllib.parse
+from threading import BoundedSemaphore
 
 # Configure logging - must be first!
 log_level = logging.INFO if os.getenv('APP_ENV') == 'development' else logging.INFO
@@ -3004,36 +3005,42 @@ def search_youtube_endpoint_v2_test():
         videos, scrape_time = scrape_youtube_links(search_query)
         timing_info['youtube_scraping'] = f"{scrape_time:.2f} seconds"
         
-        # Process videos in parallel batches
+        # Process all videos in parallel with timeout and connection limiting
         all_tutorials = []
-        batch_size = 25
-        batch_times = []
+        processing_start = time.time()
         
-        # Calculate number of batches needed
-        num_batches = (len(videos) + batch_size - 1) // batch_size
+        # Create a semaphore to limit concurrent connections
+        max_concurrent = 25  # Adjust based on your server's capacity
+        semaphore = BoundedSemaphore(max_concurrent)
         
-        # Process videos in batches
-        for batch_num in range(num_batches):
-            batch_start = time.time()
-            start_idx = batch_num * batch_size
-            end_idx = min(start_idx + batch_size, len(videos))  # Ensure we don't go past the end
-            batch = videos[start_idx:end_idx]
-
-            # Process batch in parallel
-            with ThreadPoolExecutor(max_workers=batch_size) as executor:
-                future_to_video = {executor.submit(process_video, video): video for video in batch}
-                
-                for future in as_completed(future_to_video):
-                    result = future.result()
+        def process_with_semaphore(video):
+            with semaphore:
+                return process_video(video)
+        
+        # Process all videos in parallel with timeout
+        with ThreadPoolExecutor(max_workers=len(videos)) as executor:
+            future_to_video = {
+                executor.submit(process_with_semaphore, video): video 
+                for video in videos
+            }
+            
+            # Collect results with timeout
+            for future in as_completed(future_to_video, timeout=90):
+                try:
+                    result = future.result(timeout=90)  
                     if result:
                         all_tutorials.append(result)
-            
-            batch_end = time.time()
-            batch_times.append((batch_num + 1, batch_end - batch_start))
-
-        # Add batch times to timing info
-        for batch_num, batch_time in batch_times:
-            timing_info[f'batch_{batch_num}_processing'] = f"{batch_time:.2f} seconds"
+                except TimeoutError:
+                    video = future_to_video[future]
+                    logging.warning(f"Timeout processing video: {video[0]}")
+                    continue
+                except Exception as e:
+                    video = future_to_video[future]
+                    logging.error(f"Error processing video {video[0]}: {str(e)}")
+                    continue
+        
+        processing_time = time.time() - processing_start
+        timing_info['video_processing'] = f"{processing_time:.2f} seconds"
 
         # Generate comprehensive report using selected LLM
         if all_tutorials:
