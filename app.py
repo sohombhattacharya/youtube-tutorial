@@ -2766,25 +2766,33 @@ def scrape_youtube_links(search_query):
     try:
         with sync_playwright() as p:
             # Configure browser
-            is_local = os.getenv('APP_ENV') == 'development'
-            browser_args = ['--headless=new']
+            browser_args = [
+                '--headless=new',
+                '--no-sandbox',  # Required for some Linux environments
+                '--disable-dev-shm-usage',  # Helps avoid crashes in Docker/Linux
+                '--disable-gpu',  # Reduces issues in headless mode
+                '--disable-software-rasterizer',  # Additional stability in headless
+            ]
             
-            if not is_local:
-                proxy = {
-                    "server": "http://gate.smartproxy.com:10001",
-                    "username": "spclyk9gey",
-                    "password": "2Oujegb7i53~YORtoe"
-                }
-                browser = p.chromium.launch(
-                    proxy=proxy,
-                    args=browser_args
-                )
-            else:
-                browser = p.chromium.launch(args=browser_args)
+            logging.info("Using proxy")
+            proxy = {
+                "server": "http://gate.smartproxy.com:10001",  # Changed to http
+                "username": "spclyk9gey",
+                "password": "2Oujegb7i53~YORtoe"
+            }
             
+            # Create browser context with more explicit configuration
+            browser = p.chromium.launch(
+                proxy=proxy,
+                args=browser_args,
+                chromium_sandbox=False,  # Disable sandbox for better compatibility
+            )
+            
+            # Create context with additional settings
             context = browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                ignore_https_errors=True,  # Help with proxy SSL issues
             )
             
             page = context.new_page()
