@@ -2764,7 +2764,8 @@ def scrape_youtube_links(search_query, max_retries=1):
     
     # Determine if running locally using the environment variable
     is_local = os.getenv('APP_ENV') == 'development'
-    
+    plugin_dir = 'proxy_auth_plugin'
+
     for attempt in range(max_retries):
         try:
             # Configure Chrome options
@@ -2781,7 +2782,7 @@ def scrape_youtube_links(search_query, max_retries=1):
             chrome_options.add_argument('--disable-popup-blocking')
             
             # Set up proxy only if not running locally
-            if is_local:
+            if not is_local:
                 # SmartProxy credentials
                 SMARTPROXY_USER = "spclyk9gey"
                 SMARTPROXY_PASS = "2Oujegb7i53~YORtoe"
@@ -2844,7 +2845,6 @@ def scrape_youtube_links(search_query, max_retries=1):
                 """ % (SMARTPROXY_ENDPOINT, SMARTPROXY_PORT, SMARTPROXY_USER, SMARTPROXY_PASS)
 
                 # Create a Chrome extension to handle the proxy
-                plugin_dir = 'proxy_auth_plugin'
                 if not os.path.exists(plugin_dir):
                     os.makedirs(plugin_dir)
 
