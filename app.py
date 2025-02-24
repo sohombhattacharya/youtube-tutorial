@@ -2758,92 +2758,190 @@ def create_public_report():
         return jsonify({'error': 'Internal server error'}), 500
 
 
-def scrape_youtube_links(search_query):
+def scrape_youtube_links(search_query, max_retries=1):
     start_time = time.time()
     results = []
     
-    try:
-        # Configure Chrome options
-        chrome_options = webdriver.ChromeOptions()
-        chrome_options.add_argument('--headless=new')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--disable-software-rasterizer')
-        
-        # Configure proxy
-        proxy = "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
-        chrome_options.add_argument(f'--proxy-server={proxy}')
-        
-        # Set user agent
-        chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
-        
-        # Initialize webdriver
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(60)
-        
+    # Determine if running locally using the environment variable
+    is_local = os.getenv('APP_ENV') == 'development'
+    
+    for attempt in range(max_retries):
         try:
-            # Navigate to YouTube search
-            encoded_query = urllib.parse.quote(search_query)
-            url = f"https://www.youtube.com/results?search_query={encoded_query}"
+            # Configure Chrome options
+            chrome_options = webdriver.ChromeOptions()
+            chrome_options.add_argument('--headless=new')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--disable-software-rasterizer')
+            chrome_options.add_argument('--disable-extensions')
+            chrome_options.add_argument('--disable-infobars')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument('--ignore-certificate-errors')
+            chrome_options.add_argument('--disable-popup-blocking')
             
-            logging.info(f"Navigating to {url}")
-            driver.get(url)
+            # Set up proxy only if not running locally
+            if is_local:
+                # SmartProxy credentials
+                SMARTPROXY_USER = "spclyk9gey"
+                SMARTPROXY_PASS = "2Oujegb7i53~YORtoe"
+                SMARTPROXY_ENDPOINT = "gate.smartproxy.com"
+                SMARTPROXY_PORT = "7000"  # Using HTTPS port instead of HTTP
+
+                # https://github.com/Smartproxy/Selenium-proxy-authentication
+
+                # Create manifest for Chrome extension
+                manifest_json = """
+                {
+                    "version": "1.0.0",
+                    "manifest_version": 2,
+                    "name": "Chrome Proxy",
+                    "permissions": [
+                        "proxy",
+                        "tabs",
+                        "unlimitedStorage",
+                        "storage",
+                        "<all_urls>",
+                        "webRequest",
+                        "webRequestBlocking"
+                    ],
+                    "background": {
+                        "scripts": ["background.js"]
+                    },
+                    "minimum_chrome_version":"22.0.0"
+                }
+                """
+
+                background_js = """
+                var config = {
+                    mode: "fixed_servers",
+                    rules: {
+                        singleProxy: {
+                            scheme: "https",
+                            host: "%s",
+                            port: parseInt(%s)
+                        },
+                        bypassList: ["localhost"]
+                    }
+                };
+
+                chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+
+                function callbackFn(details) {
+                    return {
+                        authCredentials: {
+                            username: "%s",
+                            password: "%s"
+                        }
+                    };
+                }
+
+                chrome.webRequest.onAuthRequired.addListener(
+                    callbackFn,
+                    {urls: ["<all_urls>"]},
+                    ['blocking']
+                );
+                """ % (SMARTPROXY_ENDPOINT, SMARTPROXY_PORT, SMARTPROXY_USER, SMARTPROXY_PASS)
+
+                # Create a Chrome extension to handle the proxy
+                plugin_dir = 'proxy_auth_plugin'
+                if not os.path.exists(plugin_dir):
+                    os.makedirs(plugin_dir)
+
+                with open(f'{plugin_dir}/manifest.json', 'w') as f:
+                    f.write(manifest_json)
+
+                with open(f'{plugin_dir}/background.js', 'w') as f:
+                    f.write(background_js)
+
+                chrome_options.add_argument(f'--load-extension={os.path.abspath(plugin_dir)}')
             
-            # Wait for video results to load
-            WebDriverWait(driver, 30).until(
-                EC.presence_of_element_located((By.TAG_NAME, "ytd-video-renderer"))
-            )
+            # Set user agent
+            chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
             
-            # Scroll to load more results
-            for _ in range(3):
-                driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-                time.sleep(1.5)  # Wait for content to load
+            # Initialize webdriver with increased timeouts
+            driver = webdriver.Chrome(options=chrome_options)
+            driver.set_page_load_timeout(60)
+            driver.implicitly_wait(20)
             
-            # Extract video information
-            video_elements = driver.find_elements(By.TAG_NAME, "ytd-video-renderer")[:25]
-            
-            for element in video_elements:
-                try:
-                    title_element = element.find_element(By.ID, "video-title")
-                    href = title_element.get_attribute("href")
-                    title = title_element.get_attribute("title")
-                    
-                    if href and title and 'watch?v=' in href:
-                        results.append((href, title))
-                        
-                except Exception as e:
-                    logging.warning(f"Error extracting video details: {str(e)}")
-                    continue
-            
-            # Upload page source to S3 for debugging
             try:
-                s3_client = boto3.client(
-                    's3',
-                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
-                )
-                bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
-                s3_key = f"youtube_page_source/{search_query}.html"
+                # Navigate to YouTube search
+                encoded_query = urllib.parse.quote(search_query)
+                url = f"https://www.youtube.com/results?search_query={encoded_query}"
                 
-                page_content = driver.page_source
-                s3_client.put_object(
-                    Bucket=bucket_name,
-                    Key=s3_key,
-                    Body=page_content,
-                    ContentType='text/html'
+                logging.info(f"Attempt {attempt + 1}: Navigating to {url}")
+                driver.get(url)
+                
+                # Wait for video results
+                wait = WebDriverWait(driver, 30)
+                wait.until(
+                    EC.presence_of_element_located((By.TAG_NAME, "ytd-video-renderer"))
                 )
-                logging.info("Page source uploaded to S3")
-            except Exception as e:
-                logging.error(f"Error uploading page source to S3: {str(e)}")
-            
-        finally:
-            # Clean up
-            driver.quit()
-            
-    except Exception as e:
-        logging.error(f"Error in scrape_youtube_links: {type(e).__name__}: {str(e)}")
-        return [], time.time() - start_time
+                
+                # Scroll gradually
+                scroll_pause_time = 2
+                for _ in range(4):
+                    driver.execute_script("window.scrollBy(0, 800);")
+                    time.sleep(scroll_pause_time)
+                
+                # Extract video information
+                video_elements = wait.until(
+                    EC.presence_of_all_elements_located((By.TAG_NAME, "ytd-video-renderer"))
+                )[:25]
+                
+                for element in video_elements:
+                    try:
+                        title_element = element.find_element(By.ID, "video-title")
+                        href = title_element.get_attribute("href")
+                        title = title_element.get_attribute("title")
+                        
+                        if href and title and 'watch?v=' in href:
+                            results.append((href, title))
+                            
+                    except Exception as e:
+                        logging.warning(f"Error extracting video details: {str(e)}")
+                        continue
+                
+                if results:
+                    try:
+                        s3_client = boto3.client(
+                            's3',
+                            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                        )
+                        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                        s3_key = f"youtube_page_source/{search_query}_{attempt}.html"
+                        
+                        page_content = driver.page_source
+                        s3_client.put_object(
+                            Bucket=bucket_name,
+                            Key=s3_key,
+                            Body=page_content,
+                            ContentType='text/html'
+                        )
+                        logging.info("Page source uploaded to S3")
+                    except Exception as e:
+                        logging.error(f"Error uploading page source to S3: {str(e)}")
+                    
+                    break
+                
+            finally:
+                try:
+                    driver.quit()
+                except Exception as e:
+                    logging.warning(f"Error closing driver: {str(e)}")
+                
+                # Clean up proxy plugin directory if it exists
+                if not is_local and os.path.exists(plugin_dir):
+                    import shutil
+                    shutil.rmtree(plugin_dir)
+                
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1} failed: {type(e).__name__}: {str(e)}")
+            if attempt == max_retries - 1:
+                logging.error("All attempts failed to scrape YouTube links")
+                return [], time.time() - start_time
+            time.sleep(2 ** attempt)
         
     end_time = time.time()
     return results, end_time - start_time
