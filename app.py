@@ -73,7 +73,6 @@ from authlib.integrations.flask_oauth2 import ResourceProtector
 from authlib.jose import jwt  # Add this import at the top
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from groq import Groq
-from playwright.sync_api import sync_playwright
 
 
 
@@ -2764,69 +2763,54 @@ def scrape_youtube_links(search_query):
     results = []
     
     try:
-        with sync_playwright() as p:
-            # Configure browser
-            browser_args = [
-                '--headless=new',
-                '--no-sandbox',  # Required for some Linux environments
-                '--disable-dev-shm-usage',  # Helps avoid crashes in Docker/Linux
-                '--disable-gpu',  # Reduces issues in headless mode
-                '--disable-software-rasterizer',  # Additional stability in headless
-            ]
-            
-            logging.info("Using proxy")
-            proxy = {
-                "server": "http://gate.smartproxy.com:10001",  # Changed to http
-                "username": "spclyk9gey",
-                "password": "2Oujegb7i53~YORtoe"
-            }
-            
-            # Create browser context with more explicit configuration
-            browser = p.chromium.launch(
-                proxy=proxy,
-                args=browser_args,
-                chromium_sandbox=False,  # Disable sandbox for better compatibility
-            )
-            
-            # Create context with additional settings
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                ignore_https_errors=True,  # Help with proxy SSL issues
-            )
-            
-            page = context.new_page()
-            
+        # Configure Chrome options
+        chrome_options = webdriver.ChromeOptions()
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--disable-software-rasterizer')
+        
+        # Configure proxy
+        proxy = "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
+        chrome_options.add_argument(f'--proxy-server={proxy}')
+        
+        # Set user agent
+        chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
+        
+        # Initialize webdriver
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.set_page_load_timeout(60)
+        
+        try:
             # Navigate to YouTube search
             encoded_query = urllib.parse.quote(search_query)
             url = f"https://www.youtube.com/results?search_query={encoded_query}"
             
             logging.info(f"Navigating to {url}")
-            page.goto(url, wait_until="networkidle")
+            driver.get(url)
             
             # Wait for video results to load
-            page.wait_for_selector("ytd-video-renderer", timeout=15000)
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.TAG_NAME, "ytd-video-renderer"))
+            )
             
             # Scroll to load more results
             for _ in range(3):
-                page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
-                page.wait_for_timeout(1500)  # Wait for content to load
+                driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
+                time.sleep(1.5)  # Wait for content to load
             
             # Extract video information
-            video_elements = page.query_selector_all("ytd-video-renderer")[:25]
+            video_elements = driver.find_elements(By.TAG_NAME, "ytd-video-renderer")[:25]
             
             for element in video_elements:
                 try:
-                    title_element = element.query_selector("#video-title")
-                    if not title_element:
-                        continue
-                        
+                    title_element = element.find_element(By.ID, "video-title")
                     href = title_element.get_attribute("href")
                     title = title_element.get_attribute("title")
                     
                     if href and title and 'watch?v=' in href:
-                        full_url = f"https://www.youtube.com{href}"
-                        results.append((full_url, title))
+                        results.append((href, title))
                         
                 except Exception as e:
                     logging.warning(f"Error extracting video details: {str(e)}")
@@ -2842,7 +2826,7 @@ def scrape_youtube_links(search_query):
                 bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
                 s3_key = f"youtube_page_source/{search_query}.html"
                 
-                page_content = page.content()
+                page_content = driver.page_source
                 s3_client.put_object(
                     Bucket=bucket_name,
                     Key=s3_key,
@@ -2853,9 +2837,9 @@ def scrape_youtube_links(search_query):
             except Exception as e:
                 logging.error(f"Error uploading page source to S3: {str(e)}")
             
+        finally:
             # Clean up
-            context.close()
-            browser.close()
+            driver.quit()
             
     except Exception as e:
         logging.error(f"Error in scrape_youtube_links: {type(e).__name__}: {str(e)}")
