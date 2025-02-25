@@ -3109,7 +3109,7 @@ def search_youtube_endpoint_v2_test():
                 "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
             )
             
-            model = genai.GenerativeModel("gemini-2.0-flash-lite-preview-02-05")
+            model = genai.GenerativeModel("gemini-2.0-flash-lite")
             response = model.generate_content(prompt)
             response_text = response.text if response else None
             
