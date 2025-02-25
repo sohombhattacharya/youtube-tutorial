@@ -80,6 +80,7 @@ def search_youtube_endpoint():
                         SELECT COUNT(*) 
                         FROM user_reports 
                         WHERE user_id = %s
+                        AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
                         """,
                         (user_id,)
                     )
@@ -88,7 +89,7 @@ def search_youtube_endpoint():
                     if report_count >= 2:
                         return jsonify({
                             'error': 'Report limit reached',
-                            'message': 'You have reached the maximum number of free reports. Please subscribe for unlimited access.'
+                            'message': 'You have reached the maximum number of free reports for this month. Please subscribe for unlimited access.'
                         }), 403
 
         except Exception as e:

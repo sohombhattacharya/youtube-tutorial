@@ -15,7 +15,6 @@ import google.generativeai as genai
 from authlib.jose import jwt
 import json
 import time
-from services.database import Database
 import psycopg2
 import psycopg2.extras
 from services.youtube_service import transcribe_youtube_video, generate_tldr

@@ -52,6 +52,7 @@ def create_app(config_name=APP_ENV):
     from routes.notes import notes_bp
     from routes.payments import payments_bp
     from routes.feedback import feedback_bp
+    from routes.quiz import quiz_bp
 
     app.register_blueprint(search_bp)
     app.register_blueprint(user_bp)
@@ -59,7 +60,7 @@ def create_app(config_name=APP_ENV):
     app.register_blueprint(notes_bp)
     app.register_blueprint(payments_bp)
     app.register_blueprint(feedback_bp)
-
+    app.register_blueprint(quiz_bp)
     return app
 
 app = create_app()

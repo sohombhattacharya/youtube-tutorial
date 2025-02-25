@@ -118,3 +118,13 @@ CREATE TABLE public_shared_reports (
         (user_report_id IS NOT NULL AND visitor_report_id IS NULL)
     )
 );
+
+CREATE TABLE note_generation_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    youtube_video_id TEXT NOT NULL,
+    youtube_video_url TEXT NOT NULL,
+    note_type TEXT NOT NULL,
+    generated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(user_id, youtube_video_id)
+);

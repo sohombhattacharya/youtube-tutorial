@@ -88,26 +88,30 @@ def generate_tutorial_endpoint():
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Check if user has already viewed this note
+                # First check if this video has already been generated (doesn't count toward limit)
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM user_notes WHERE user_id = %s AND youtube_video_url LIKE %s)",
-                    (user_id, f'%{video_id}%')
+                    "SELECT EXISTS(SELECT 1 FROM note_generation_history WHERE user_id = %s AND youtube_video_id = %s)",
+                    (user_id, video_id)
                 )
-                has_viewed = cur.fetchone()[0]
+                already_generated = cur.fetchone()[0]
                 
-                if not has_viewed:
-                    # If they haven't viewed it before, check their total note count
-                    cur.execute("SELECT COUNT(*) FROM user_notes WHERE user_id = %s", (user_id,))
-                    note_count = cur.fetchone()[0]
+                if not already_generated:
+                    # Check monthly limit (2 unique videos per month)
+                    cur.execute("""
+                        SELECT COUNT(DISTINCT youtube_video_id) FROM note_generation_history 
+                        WHERE user_id = %s 
+                        AND generated_at >= date_trunc('month', CURRENT_DATE)
+                    """, (user_id,))
+                    monthly_video_count = cur.fetchone()[0]
                     
-                    if note_count >= 3:
+                    if monthly_video_count >= 2:
                         return jsonify({
-                            'error': 'Free note limit reached',
-                            'message': 'You have reached the maximum number of free notes. Please subscribe for unlimited access.'
+                            'error': 'Monthly note limit reached',
+                            'message': 'You have reached the maximum number of free notes for this month (2). Please subscribe for unlimited access.'
                         }), 403
 
         except Exception as e:
-            logging.error(f"Database error checking user notes: {str(e)}")
+            logging.error(f"Database error checking note generation history: {str(e)}")
             return jsonify({'error': 'Internal server error'}), 500
 
     # Create an S3 client
@@ -127,29 +131,24 @@ def generate_tutorial_endpoint():
             s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
             tutorial = s3_response['Body'].read().decode('utf-8')  # Read the markdown content
 
-            # Record the view only if user is not ACTIVE
-            if subscription_status != 'ACTIVE':
-                try:
-                    # Extract title from the tutorial content (first line or first 50 chars)
-                    title = tutorial.split('\n', 1)[0][:50]
-                    if not title:
-                        title = f"YouTube Video {video_id}"
-                    
-                    conn = get_db_connection()
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            INSERT INTO user_notes (user_id, title, youtube_video_url) 
-                            VALUES (%s, %s, %s) 
-                            ON CONFLICT (user_id, youtube_video_url) DO NOTHING
-                            """,
-                            (user_id, title, video_url)
-                        )
-                    conn.commit()
-                except Exception as e:
-                    logging.error(f"Error recording user note: {str(e)}")
-                    # Continue execution even if operation fails
-                    pass
+            # Record in history table for all users
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    # Record the generation in history
+                    cur.execute(
+                        """
+                        INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
+                        VALUES (%s, %s, %s, %s) 
+                        ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                        """,
+                        (user_id, video_id, video_url, 'tutorial')
+                    )
+                conn.commit()
+            except Exception as e:
+                logging.error(f"Error recording note generation: {str(e)}")
+                # Continue execution even if this fails
+                pass
 
             return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
         except s3_client.exceptions.NoSuchKey:
@@ -168,29 +167,24 @@ def generate_tutorial_endpoint():
                 ContentType='text/plain'
             )
             
-            # Record the view only if user is not ACTIVE
-            if subscription_status != 'ACTIVE':
-                try:
-                    # Extract title from the tutorial content (first line or first 50 chars)
-                    title = tutorial.split('\n', 1)[0][:50]
-                    if not title:
-                        title = f"YouTube Video {video_id}"
-                    
-                    conn = get_db_connection()
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            INSERT INTO user_notes (user_id, title, youtube_video_url) 
-                            VALUES (%s, %s, %s) 
-                            ON CONFLICT (user_id, youtube_video_url) DO NOTHING
-                            """,
-                            (user_id, title, video_url)
-                        )
-                    conn.commit()
-                except Exception as e:
-                    logging.error(f"Error recording user note: {str(e)}")
-                    # Continue execution even if operation fails
-                    pass
+            # Record in history table for all users
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    # Record the generation in history
+                    cur.execute(
+                        """
+                        INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
+                        VALUES (%s, %s, %s, %s) 
+                        ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                        """,
+                        (user_id, video_id, video_url, 'tutorial')
+                    )
+                conn.commit()
+            except Exception as e:
+                logging.error(f"Error recording note generation: {str(e)}")
+                # Continue execution even if this fails
+                pass
 
             return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except Exception as e:
@@ -240,7 +234,6 @@ def get_tutorial():
                     
         except Exception as e:
             logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
-            # Continue execution with default INACTIVE status
     
     if auth0_id is None:
         return jsonify({'error': 'Authentication required'}), 401
@@ -254,31 +247,37 @@ def get_tutorial():
     
     video_id = video_id_match.group(1)
 
-    # Check note access only if user is not ACTIVE
+    # Check if user has already viewed this video
+    # If not, check limits for non-active users and record the view
+    note_type = 'tldr' if is_tldr else 'tutorial'
+    
     if subscription_status != 'ACTIVE':
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Check if user has already viewed this note
+                # First check if this video has already been viewed by this user
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM user_notes WHERE user_id = %s AND youtube_video_url LIKE %s)",
-                    (user_id, f'%{video_id}%')
+                    "SELECT EXISTS(SELECT 1 FROM note_generation_history WHERE user_id = %s AND youtube_video_id = %s)",
+                    (user_id, video_id)
                 )
-                has_viewed = cur.fetchone()[0]
+                already_viewed = cur.fetchone()[0]
                 
-                if not has_viewed:
-                    # If they haven't viewed it before, check their total note count
-                    cur.execute("SELECT COUNT(*) FROM user_notes WHERE user_id = %s", (user_id,))
-                    note_count = cur.fetchone()[0]
+                if not already_viewed:
+                    # Check monthly limit (2 unique videos per month)
+                    cur.execute("""
+                        SELECT COUNT(DISTINCT youtube_video_id) FROM note_generation_history 
+                        WHERE user_id = %s 
+                        AND generated_at >= date_trunc('month', CURRENT_DATE)
+                    """, (user_id,))
+                    monthly_video_count = cur.fetchone()[0]
                     
-                    if note_count >= 3:
+                    if monthly_video_count >= 2:
                         return jsonify({
-                            'error': 'Free note limit reached',
-                            'message': 'You have reached the maximum number of free notes. Please subscribe for unlimited access.'
+                            'error': 'Monthly note limit reached',
+                            'message': 'You have reached the maximum number of free notes for this month (2). Please subscribe for unlimited access.'
                         }), 403
-
         except Exception as e:
-            logging.error(f"Database error checking user notes: {str(e)}")
+            logging.error(f"Database error checking note generation history: {str(e)}")
             return jsonify({'error': 'Internal server error'}), 500
 
     # Create an S3 client
@@ -297,28 +296,24 @@ def get_tutorial():
         s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
         content = s3_response['Body'].read().decode('utf-8')
 
-        # Record the view only if user is not ACTIVE
-        if subscription_status != 'ACTIVE':
-            try:
-                # Extract title from the content (first line or first 50 chars)
-                title = content.split('\n', 1)[0][:50]
-                if not title:
-                    title = f"YouTube Video {video_id}"
-                
-                conn = get_db_connection()
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO user_notes (user_id, title, youtube_video_url) 
-                        VALUES (%s, %s, %s) 
-                        ON CONFLICT (user_id, youtube_video_url) DO NOTHING
-                        """,
-                        (user_id, title, video_url)
-                    )
-                conn.commit()
-            except Exception as e:
-                logging.error(f"Error recording user note: {str(e)}")
-                # Continue execution even if this fails
+        # Record this view in history if it's a new view for this user
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                # Record the view in history
+                cur.execute(
+                    """
+                    INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
+                    VALUES (%s, %s, %s, %s) 
+                    ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                    """,
+                    (user_id, video_id, video_url, note_type)
+                )
+            conn.commit()
+        except Exception as e:
+            logging.error(f"Error recording note view: {str(e)}")
+            # Continue execution even if this fails
+            pass
 
         return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except s3_client.exceptions.NoSuchKey:
@@ -386,26 +381,30 @@ def generate_tldr_endpoint():
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Check if user has already viewed this note
+                # First check if this video has already been generated (doesn't count toward limit)
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM user_notes WHERE user_id = %s AND youtube_video_url LIKE %s)",
-                    (user_id, f'%{video_id}%')
+                    "SELECT EXISTS(SELECT 1 FROM note_generation_history WHERE user_id = %s AND youtube_video_id = %s)",
+                    (user_id, video_id)
                 )
-                has_viewed = cur.fetchone()[0]
+                already_generated = cur.fetchone()[0]
                 
-                if not has_viewed:
-                    # If they haven't viewed it before, check their total note count
-                    cur.execute("SELECT COUNT(*) FROM user_notes WHERE user_id = %s", (user_id,))
-                    note_count = cur.fetchone()[0]
+                if not already_generated:
+                    # Check monthly limit (2 unique videos per month)
+                    cur.execute("""
+                        SELECT COUNT(DISTINCT youtube_video_id) FROM note_generation_history 
+                        WHERE user_id = %s 
+                        AND generated_at >= date_trunc('month', CURRENT_DATE)
+                    """, (user_id,))
+                    monthly_video_count = cur.fetchone()[0]
                     
-                    if note_count >= 3:
+                    if monthly_video_count >= 2:
                         return jsonify({
-                            'error': 'Free note limit reached',
-                            'message': 'You have reached the maximum number of free notes. Please subscribe for unlimited access.'
+                            'error': 'Monthly note limit reached',
+                            'message': 'You have reached the maximum number of free notes for this month (2). Please subscribe for unlimited access.'
                         }), 403
 
         except Exception as e:
-            logging.error(f"Database error checking user notes: {str(e)}")
+            logging.error(f"Database error checking note generation history: {str(e)}")
             return jsonify({'error': 'Internal server error'}), 500
 
     s3_client = boto3.client(
@@ -422,27 +421,24 @@ def generate_tldr_endpoint():
             s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
             tldr = s3_response['Body'].read().decode('utf-8')
 
-            if subscription_status != 'ACTIVE':
-                try:
-                    # Extract title from the content (first line or first 50 chars)
-                    title = tldr.split('\n', 1)[0][:50]
-                    if not title:
-                        title = f"TLDR: YouTube Video {video_id}"
-                    
-                    conn = get_db_connection()
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            INSERT INTO user_notes (user_id, title, youtube_video_url) 
-                            VALUES (%s, %s, %s) 
-                            ON CONFLICT (user_id, youtube_video_url) DO NOTHING
-                            """,
-                            (user_id, title, video_url)
-                        )
-                    conn.commit()
-                except Exception as e:
-                    logging.error(f"Error recording user note: {str(e)}")
-                    pass
+            # Record in history table for all users
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    # Record the generation in history
+                    cur.execute(
+                        """
+                        INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
+                        VALUES (%s, %s, %s, %s) 
+                        ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                        """,
+                        (user_id, video_id, video_url, 'tldr')
+                    )
+                conn.commit()
+            except Exception as e:
+                logging.error(f"Error recording note generation: {str(e)}")
+                # Continue execution even if this fails
+                pass
 
             return tldr, 200, {'Content-Type': 'text/plain; charset=utf-8'}
         except s3_client.exceptions.NoSuchKey:
@@ -471,27 +467,24 @@ def generate_tldr_endpoint():
                 ContentType='text/plain'
             )
             
-            if subscription_status != 'ACTIVE':
-                try:
-                    # Extract title from the content (first line or first 50 chars)
-                    title = tldr.split('\n', 1)[0][:50]
-                    if not title:
-                        title = f"TLDR: YouTube Video {video_id}"
-                    
-                    conn = get_db_connection()
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            INSERT INTO user_notes (user_id, title, youtube_video_url) 
-                            VALUES (%s, %s, %s) 
-                            ON CONFLICT (user_id, youtube_video_url) DO NOTHING
-                            """,
-                            (user_id, title, video_url)
-                        )
-                    conn.commit()
-                except Exception as e:
-                    logging.error(f"Error recording user note: {str(e)}")
-                    pass
+            # Record in history table for all users
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    # Record the generation in history
+                    cur.execute(
+                        """
+                        INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
+                        VALUES (%s, %s, %s, %s) 
+                        ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                        """,
+                        (user_id, video_id, video_url, 'tldr')
+                    )
+                conn.commit()
+            except Exception as e:
+                logging.error(f"Error recording note generation: {str(e)}")
+                # Continue execution even if this fails
+                pass
 
             return tldr, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except Exception as e:
@@ -663,11 +656,26 @@ def save_note():
             if not user:
                 return jsonify({'error': 'User not found'}), 404
             
+            # Remove the subscription check - allow non-subscribers to save notes
+            # But enforce the 3-note limit for non-subscribers
             if user['subscription_status'] != 'ACTIVE':
-                return jsonify({
-                    'error': 'Subscription required',
-                    'message': 'An active subscription is required to save notes'
-                }), 403
+                # Check if they already have 3 or more notes
+                cur.execute("SELECT COUNT(*) FROM user_notes WHERE user_id = %s", (user['id'],))
+                note_count = cur.fetchone()[0]
+                
+                # Check if this URL is already saved (doesn't count toward limit)
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM user_notes WHERE user_id = %s AND youtube_video_url = %s)",
+                    (user['id'], youtube_url)
+                )
+                already_saved = cur.fetchone()[0]
+                
+                # If they have 3 notes and this isn't already saved, reject
+                if note_count >= 3 and not already_saved:
+                    return jsonify({
+                        'error': 'Free note limit reached',
+                        'message': 'You have reached the maximum number of 3 saved notes. Please subscribe for saving unlimited notes!'
+                    }), 403
 
             # Try to insert the note
             try:
@@ -725,33 +733,30 @@ def is_saved():
 
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            # Check user's subscription status and if note is saved
+            # Check if note is saved, regardless of subscription status
             cur.execute(
                 """
-                SELECT u.subscription_status, 
-                       EXISTS(
-                           SELECT 1 
-                           FROM user_notes un 
-                           WHERE un.user_id = u.id 
-                           AND un.youtube_video_url = %s
-                       ) as note_saved
+                SELECT EXISTS(
+                    SELECT 1 
+                    FROM user_notes un 
+                    JOIN users u ON un.user_id = u.id
+                    WHERE u.auth0_id = %s 
+                    AND un.youtube_video_url = %s
+                ) as note_saved
                 FROM users u 
                 WHERE u.auth0_id = %s
                 """,
-                (youtube_url, auth0_id)
+                (auth0_id, youtube_url, auth0_id)
             )
             
             result = cur.fetchone()
             if not result:
                 return jsonify({'error': 'User not found'}), 404
             
-            subscription_status, is_saved = result
-            
-            # Only return saved status if user has active subscription
-            saved_status = is_saved if subscription_status == 'ACTIVE' else False
+            is_saved = result['note_saved']
             
             return jsonify({
-                'saved': saved_status
+                'saved': is_saved
             }), 200
 
     except JoseError as e:
@@ -921,12 +926,6 @@ def delete_note():
             user = cur.fetchone()
             if not user:
                 return jsonify({'error': 'User not found'}), 404
-            
-            if user['subscription_status'] != 'ACTIVE':
-                return jsonify({
-                    'error': 'Subscription required',
-                    'message': 'An active subscription is required to manage saved notes'
-                }), 403
 
             # Delete the note, ensuring it belongs to the user
             try:
@@ -957,4 +956,80 @@ def delete_note():
         return jsonify({'error': 'Invalid authentication token'}), 401
     except Exception as e:
         logging.error(f"Error in delete_note: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@notes_bp.route('/get_free_monthly_usage', methods=['GET'])
+def get_free_monthly_usage():
+    try:
+        # Get token from Authorization header and decode it
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        token = auth_header.split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": AUTH0_AUDIENCE},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Get user's subscription status and ID
+            cur.execute("""
+                SELECT id, subscription_status 
+                FROM users 
+                WHERE auth0_id = %s
+            """, (auth0_id,))
+            
+            user = cur.fetchone()
+            if not user:
+                return jsonify({'error': 'User not found'}), 404
+            
+            user_id = user['id']
+            subscription_status = user['subscription_status']
+            
+            notes_limit = 2  # 2 notes per month for free users
+            reports_limit = 2  # 2 reports per month for free users
+            
+            # Count notes generated this month
+            cur.execute("""
+                SELECT COUNT(DISTINCT youtube_video_id) 
+                FROM note_generation_history 
+                WHERE user_id = %s 
+                AND generated_at >= date_trunc('month', CURRENT_DATE)
+            """, (user_id,))
+            notes_used = cur.fetchone()[0]
+            
+            # Count research reports generated this month
+            cur.execute("""
+                SELECT COUNT(*) 
+                FROM user_reports 
+                WHERE user_id = %s
+                AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+            """, (user_id,))
+            reports_used = cur.fetchone()[0]
+            
+            return jsonify({
+                'notes': {
+                    'used': notes_used,
+                    'limit': notes_limit,
+                    'unlimited': subscription_status == 'ACTIVE'
+                },
+                'reports': {
+                    'used': reports_used,
+                    'limit': reports_limit,
+                    'unlimited': subscription_status == 'ACTIVE'
+                },
+            }), 200
+
+    except JoseError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in get_monthly_usage: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
