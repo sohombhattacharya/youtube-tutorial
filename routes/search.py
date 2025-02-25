@@ -1,0 +1,846 @@
+from flask import Blueprint, request, jsonify, g, send_file, make_response, current_app
+import logging
+import re
+import os
+import boto3
+import tempfile
+from xhtml2pdf import pisa
+import fitz  # PyMuPDF
+import io
+import zipfile
+import requests
+from youtube_transcript_api import YouTubeTranscriptApi
+import google.generativeai as genai
+from authlib.jose import jwt
+import json
+import time
+import urllib.parse
+from services.youtube_service import transcribe_youtube_video, generate_tldr
+from services.auth_service import auth0_validator, AUTH0_DOMAIN
+from services.database import get_db_connection
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from threading import BoundedSemaphore
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+search_bp = Blueprint('search', __name__)
+
+@search_bp.route('/search_youtube', methods=['GET'])
+def search_youtube_endpoint():
+    try:
+        auth_header = request.headers.get('Authorization')
+        visitor_id = request.args.get('visitor_id')
+        search_query = request.args.get('query')
+        
+        if not search_query:
+            return jsonify({'error': 'Search query is required'}), 400
+
+        # Handle authenticated users first
+        if auth_header and auth_header.startswith('Bearer '):
+            # ... existing auth user logic ...
+            token = auth_header.split(' ')[1]
+            try:
+                decoded_token = jwt.decode(
+                    token,
+                    auth0_validator.public_key,
+                    claims_options={
+                        "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                        "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                    }
+                )
+                auth0_id = decoded_token['sub']
+
+                # Check user's subscription status and get user_id
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, subscription_status 
+                        FROM users 
+                        WHERE auth0_id = %s
+                        """,
+                        (auth0_id,)
+                    )
+                    result = cur.fetchone()
+                    if not result or result[1] != 'ACTIVE':
+                        return jsonify({
+                            'error': 'Subscription required',
+                            'message': 'An active subscription is required to use this feature'
+                        }), 403
+                    user_id = result[0]
+
+            except Exception as e:
+                logging.error(f"Error verifying token: {str(e)}")
+                return jsonify({'error': 'Authentication error'}), 401
+
+        # If no auth header, check visitor_id and their report limit
+        elif not visitor_id:
+            return jsonify({'error': 'Authentication or visitor ID required'}), 401
+        else:
+            # Check if visitor has already generated a report
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) 
+                    FROM visitor_reports 
+                    WHERE visitor_id = %s
+                    """,
+                    (visitor_id,)
+                )
+                report_count = cur.fetchone()[0]
+                
+                if report_count >= 2:
+                    return jsonify({
+                        'error': 'Report limit reached',
+                        'message': 'You have reached the maximum number of free reports. Please sign up for unlimited access.'
+                    }), 403
+
+        # Replace with your actual API key
+        API_KEY = os.getenv('GOOGLE_API_KEY')
+        
+        # Log info for request
+        if auth_header:
+            logging.info(f"Received request at /search_youtube with query: {search_query} from user {auth0_id}")
+        else:
+            logging.info(f"Received request at /search_youtube with query: {search_query} from visitor {visitor_id}")
+
+        # Search YouTube with 25 results
+        videos = search_youtube(search_query, API_KEY, max_results=25)
+        
+        # Generate tutorials for each video
+        all_tutorials = []
+        for video in videos:
+            try:
+                video_url = video['url']
+                video_title = video['title']
+                
+                # Extract video ID from URL
+                video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
+                if not video_id_match:
+                    continue
+                video_id = video_id_match.group(1)
+                
+                # Check if tutorial exists in S3
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                )
+                bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                s3_key = f"notes/{video_id}"
+                
+                try:
+                    s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                    tutorial = s3_response['Body'].read().decode('utf-8')
+                except s3_client.exceptions.NoSuchKey:
+                    # Generate new tutorial if not found
+                    tutorial = transcribe_youtube_video(video_id, video_url)
+
+                    s3_client.put_object(
+                        Bucket=bucket_name,
+                        Key=s3_key,
+                        Body=tutorial,
+                        ContentType='text/plain'
+                    )
+                
+                all_tutorials.append({
+                    'title': video_title,
+                    'url': video_url,
+                    'content': tutorial
+                })
+                
+            except Exception as e:
+                logging.error(f"Error processing video {video_url}: {str(e)}")
+                continue
+
+        # Generate comprehensive report using Gemini
+        if all_tutorials:
+            prompt = (
+                "# Analysis Task\n\n"
+                f"## User Query\n{search_query}\n\n"
+                "## Task Overview\n"
+                "1. First, analyze the user's query to understand:\n"
+                "   - Is this a specific question seeking direct answers?\n"
+                "   - Is this a broad topic requiring synthesis and exploration?\n"
+                "   - What are the key aspects or dimensions that need to be addressed?\n"
+                "   - What would be most valuable to the user based on their query?\n"
+                "   - What deeper implications or connections should be explored?\n\n"
+                "2. Then, without mentioning the type of the user's query, and without mentioning that this is an analysis of video transcripts, structure your response appropriately based on the query type. For example:\n"
+                "   - For specific questions: Provide comprehensive answers with in-depth analysis and multiple perspectives\n"
+                "   - For broad topics: Deliver thorough synthesis with detailed exploration of key themes\n"
+                "   - For comparisons: Examine nuanced differences and complex trade-offs\n"
+                "   - For how-to queries: Include detailed methodology and consideration of edge cases\n\n"
+                "## Content Guidelines\n"
+                " - Create a title for the report that is a summary of the report\n"
+                "- Structure the response in the most logical way for this specific query\n"
+                "- Deeply analyze different perspectives and approaches\n"
+                "- Highlight both obvious and subtle connections between sources\n"
+                "- Examine any contradictions or disagreements in detail\n"
+                "- Draw meaningful conclusions that directly relate to the query\n"
+                "- Consider practical implications and real-world applications\n"
+                "- Explore edge cases and potential limitations\n"
+                "- Identify patterns and trends across sources\n\n"
+                "## Citation and Reference Guidelines\n"
+                "- Include timestamp links whenever referencing specific content\n"
+                "- Add timestamps for:\n"
+                "  * Direct quotes or key statements\n"
+                "  * Important examples or demonstrations\n"
+                "  * Technical explanations or tutorials\n"
+                "  * Expert opinions or insights\n"
+                "  * Supporting evidence for major claims\n"
+                "  * Contrasting viewpoints or approaches\n"
+                "- Format timestamps as markdown links to specific moments in the videos\n"
+                "- Integrate timestamps naturally into the text to maintain readability\n"
+                "- Use multiple timestamps when a point is supported across different sources\n\n"
+                "## Formatting Requirements\n"
+                "- Use proper markdown headers (# for main title, ## for sections)\n"
+                "- Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "- Format quotes with > for blockquotes\n"
+                "- Use **bold** for emphasis\n"
+                "- Ensure all newlines are proper markdown line breaks\n"
+                "- Format timestamps as [MM:SS](video-link) or similar\n\n"
+                "## Source Materials\n"
+                f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
+                "Analyze these materials thoroughly to provide a detailed, well-reasoned response that best serves the user's needs. "
+                "Don't summarize - dig deep into the content and explore all relevant aspects and implications. "
+                "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
+            )
+            
+            # Add each tutorial's content with its source
+            for tutorial in all_tutorials:
+                prompt += f"\n### Video: {tutorial['title']}\n{tutorial['content']}\n"
+            
+            # Generate the report
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                # Get environment and base URL
+                is_dev = os.getenv('APP_ENV') == 'development'
+                base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
+                
+                # Create a mapping of video IDs to source numbers
+                video_id_to_source = {}
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        video_id_to_source[video_id] = i
+
+                # Update timestamp hyperlinks with source numbers
+                def add_source_number(match):
+                    url = match.group(0)
+                    
+                    # Only process links that are actual YouTube timestamp links
+                    if not ('youtu.be' in url and '?t=' in url):
+                        return url
+                        
+                    video_id_match = re.search(r'youtu\.be/([0-9A-Za-z_-]{11})', url)
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        source_num = video_id_to_source.get(video_id)
+                        if source_num:
+                            # Extract the display text (time) from the markdown link
+                            display_text_match = re.search(r'\[(.*?)\]', url)
+                            if not display_text_match:
+                                return url
+                            display_text = display_text_match.group(1)
+                            
+                            # Extract the URL part from the markdown link
+                            url_match = re.search(r'\((.*?)\)', url)
+                            if not url_match:
+                                return url
+                            url_part = url_match.group(1)
+                            
+                            # Verify this is a valid timestamp link before formatting
+                            if display_text and url_part and 'youtu.be' in url_part and '?t=' in url_part:
+                                return f'[({source_num}) {display_text}]({url_part})'
+                        return url
+                    return url
+
+                # Update the regex pattern to only match YouTube timestamp links
+                markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
+
+               # Add the sources section
+                markdown_content += "\n\n## Sources\n"
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        note_url = f"{base_url}/?v={video_id}"
+                        markdown_content += f"{i}. [{tutorial['title']}]({note_url})\n"
+                    else:
+                        markdown_content += f"{i}. [{tutorial['title']}]({tutorial['url']})\n"
+
+                # After generating the markdown content, handle differently for auth vs visitor
+                if markdown_content:
+                    report_id = None
+                    if auth_header:
+                        try:
+                            # ... existing auth user report saving logic ...
+                            # Extract title
+                            title = None
+                            for line in markdown_content.split('\n'):
+                                if line.startswith('# '):
+                                    title = line.replace('# ', '').strip()
+                                    break
+                                if line.startswith('## '):
+                                    title = line.replace('## ', '').strip()
+                                    break
+                            
+                            if not title:
+                                first_line = markdown_content.split('\n')[0].strip()
+                                if first_line:
+                                    title = first_line[:100]
+                                else:
+                                    title = f"Research Report: {search_query[:50]}"
+                            
+                            if not title or len(title.strip()) == 0:
+                                title = f"Research Report: {search_query[:50]}"
+                                
+                            logging.info(f"Extracted title: {title}")
+
+                            # Save to database
+                            conn = get_db_connection()
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO user_reports 
+                                    (user_id, search_query, title, created_at)
+                                    VALUES (%s, %s, %s, NOW())
+                                    RETURNING id
+                                    """,
+                                    (user_id, search_query, title)
+                                )
+                                report_id = cur.fetchone()[0]
+                                conn.commit()
+
+                            # Save to S3
+                            s3_key = f"reports/{report_id}"
+                            s3_client.put_object(
+                                Bucket=bucket_name,
+                                Key=s3_key,
+                                Body=markdown_content,
+                                ContentType='text/plain'
+                            )
+
+                        except Exception as e:
+                            logging.error(f"Error saving report: {str(e)}")
+                            return jsonify({'error': 'Failed to save report'}), 500
+                    else:
+                        # For visitors, just save to visitor_reports table
+                        try:
+                            conn = get_db_connection()
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO visitor_reports 
+                                    (visitor_id, search_query)
+                                    VALUES (%s, %s)
+                                    RETURNING id
+                                    """,
+                                    (visitor_id, search_query)
+                                )
+                                report_id = cur.fetchone()[0]
+                                conn.commit()
+
+                                s3_key = f"visitor_reports/{report_id}"
+                                s3_client.put_object(
+                                    Bucket=bucket_name,
+                                    Key=s3_key,
+                                    Body=markdown_content,
+                                    ContentType='text/plain'
+                                )                                
+                        except Exception as e:
+                            logging.error(f"Error saving visitor report: {str(e)}")
+                            # Continue even if saving fails
+
+                    # Add report ID to response headers
+
+                    return jsonify({
+                        'id': str(report_id),
+                        'content': markdown_content,
+
+                    }), 200
+                else:
+                    return jsonify({'error': 'Failed to generate report'}), 500
+            
+    except Exception as e:
+        logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+def search_youtube(query, api_key, max_results=10):
+    """
+    Search YouTube for videos matching the query and return their URLs and titles.
+    
+    Args:
+        query (str): Search term
+        api_key (str): YouTube Data API key
+        max_results (int): Maximum number of results to return (default 10)
+    """
+    try:
+        # Create YouTube API client
+        youtube = build('youtube', 'v3', developerKey=api_key)
+        
+        # Call the search.list method
+        search_response = youtube.search().list(
+            q=query,
+            part='id,snippet',  # Added snippet to get video titles
+            maxResults=max_results,
+            type='video'  # Only search for videos
+        ).execute()
+        
+        # Extract video URLs and titles
+        videos = []
+        for item in search_response['items']:
+            video_id = item['id']['videoId']
+            video_url = f'https://www.youtube.com/watch?v={video_id}'
+            video_title = item['snippet']['title']
+            videos.append({'url': video_url, 'title': video_title})
+            
+        return videos
+        
+    except HttpError as e:
+        print(f'An HTTP error {e.resp.status} occurred: {e.content}')
+        return []
+
+def scrape_youtube_links(search_query, max_retries=1):
+    start_time = time.time()
+    results = []
+    
+    # Determine if running locally using the environment variable
+    is_local = os.getenv('APP_ENV') == 'development'
+    plugin_dir = 'proxy_auth_plugin'
+
+    for attempt in range(max_retries):
+        try:
+            # Configure Chrome options
+            chrome_options = webdriver.ChromeOptions()
+            chrome_options.add_argument('--headless=new')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--disable-software-rasterizer')
+            chrome_options.add_argument('--disable-extensions')
+            chrome_options.add_argument('--disable-infobars')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument('--ignore-certificate-errors')
+            chrome_options.add_argument('--disable-popup-blocking')
+            
+            # Set up proxy only if not running locally
+            if not is_local:
+                # SmartProxy credentials
+                SMARTPROXY_USER = "spclyk9gey"
+                SMARTPROXY_PASS = "2Oujegb7i53~YORtoe"
+                SMARTPROXY_ENDPOINT = "gate.smartproxy.com"
+                SMARTPROXY_PORT = "7000"  # Using HTTPS port instead of HTTP
+
+                # https://github.com/Smartproxy/Selenium-proxy-authentication
+
+                # Create manifest for Chrome extension
+                manifest_json = """
+                {
+                    "version": "1.0.0",
+                    "manifest_version": 2,
+                    "name": "Chrome Proxy",
+                    "permissions": [
+                        "proxy",
+                        "tabs",
+                        "unlimitedStorage",
+                        "storage",
+                        "<all_urls>",
+                        "webRequest",
+                        "webRequestBlocking"
+                    ],
+                    "background": {
+                        "scripts": ["background.js"]
+                    },
+                    "minimum_chrome_version":"22.0.0"
+                }
+                """
+
+                background_js = """
+                var config = {
+                    mode: "fixed_servers",
+                    rules: {
+                        singleProxy: {
+                            scheme: "https",
+                            host: "%s",
+                            port: parseInt(%s)
+                        },
+                        bypassList: ["localhost"]
+                    }
+                };
+
+                chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+
+                function callbackFn(details) {
+                    return {
+                        authCredentials: {
+                            username: "%s",
+                            password: "%s"
+                        }
+                    };
+                }
+
+                chrome.webRequest.onAuthRequired.addListener(
+                    callbackFn,
+                    {urls: ["<all_urls>"]},
+                    ['blocking']
+                );
+                """ % (SMARTPROXY_ENDPOINT, SMARTPROXY_PORT, SMARTPROXY_USER, SMARTPROXY_PASS)
+
+                # Create a Chrome extension to handle the proxy
+                if not os.path.exists(plugin_dir):
+                    os.makedirs(plugin_dir)
+
+                with open(f'{plugin_dir}/manifest.json', 'w') as f:
+                    f.write(manifest_json)
+
+                with open(f'{plugin_dir}/background.js', 'w') as f:
+                    f.write(background_js)
+
+                chrome_options.add_argument(f'--load-extension={os.path.abspath(plugin_dir)}')
+            
+            # Set user agent
+            chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
+            
+            # Initialize webdriver with increased timeouts
+            driver = webdriver.Chrome(options=chrome_options)
+            driver.set_page_load_timeout(60)
+            driver.implicitly_wait(20)
+            
+            try:
+                # Navigate to YouTube search
+                encoded_query = urllib.parse.quote(search_query)
+                url = f"https://www.youtube.com/results?search_query={encoded_query}"
+                
+                logging.info(f"Attempt {attempt + 1}: Navigating to {url}")
+                driver.get(url)
+                
+                # Wait for video results
+                wait = WebDriverWait(driver, 30)
+                wait.until(
+                    EC.presence_of_element_located((By.TAG_NAME, "ytd-video-renderer"))
+                )
+                
+                # Scroll gradually
+                scroll_pause_time = 2
+                for _ in range(4):
+                    driver.execute_script("window.scrollBy(0, 800);")
+                    time.sleep(scroll_pause_time)
+                
+                # Extract video information
+                video_elements = wait.until(
+                    EC.presence_of_all_elements_located((By.TAG_NAME, "ytd-video-renderer"))
+                )[:25]
+                
+                for element in video_elements:
+                    try:
+                        title_element = element.find_element(By.ID, "video-title")
+                        href = title_element.get_attribute("href")
+                        title = title_element.get_attribute("title")
+                        
+                        if href and title and 'watch?v=' in href:
+                            results.append((href, title))
+                            
+                    except Exception as e:
+                        logging.warning(f"Error extracting video details: {str(e)}")
+                        continue
+                
+                if results:
+                    try:
+                        s3_client = boto3.client(
+                            's3',
+                            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                        )
+                        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                        s3_key = f"youtube_page_source/{search_query}_{attempt}.html"
+                        
+                        page_content = driver.page_source
+                        s3_client.put_object(
+                            Bucket=bucket_name,
+                            Key=s3_key,
+                            Body=page_content,
+                            ContentType='text/html'
+                        )
+                        logging.info("Page source uploaded to S3")
+                    except Exception as e:
+                        logging.error(f"Error uploading page source to S3: {str(e)}")
+                    
+                    break
+                
+            finally:
+                try:
+                    driver.quit()
+                except Exception as e:
+                    logging.warning(f"Error closing driver: {str(e)}")
+                
+                # Clean up proxy plugin directory if it exists
+                if not is_local and os.path.exists(plugin_dir):
+                    import shutil
+                    shutil.rmtree(plugin_dir)
+                
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1} failed: {type(e).__name__}: {str(e)}")
+            if attempt == max_retries - 1:
+                logging.error("All attempts failed to scrape YouTube links")
+                return [], time.time() - start_time
+            time.sleep(2 ** attempt)
+        
+    end_time = time.time()
+    return results, end_time - start_time
+
+def process_video(video):
+    """Helper function to process a single video and get its tutorial"""
+    try:
+        video_url = video[0]  # URL is first element in tuple
+        video_title = video[1]  # Title is second element in tuple
+        
+        # Extract video ID from URL
+        video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
+        if not video_id_match:
+            return None
+        video_id = video_id_match.group(1)
+        
+        # Check if tutorial exists in S3
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+        )
+        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+        s3_key = f"notes/{video_id}"
+        
+        try:
+            s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+            tutorial = s3_response['Body'].read().decode('utf-8')
+        except s3_client.exceptions.NoSuchKey:
+            # Generate new tutorial if not found
+            tutorial = transcribe_youtube_video(video_id, video_url, rotate_proxy=True)
+
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=tutorial,
+                ContentType='text/plain'
+            )
+        
+        return {
+            'title': video_title,
+            'url': video_url,
+            'content': tutorial
+        }
+        
+    except Exception as e:
+        logging.error(f"Error processing video {video_url}: {str(e)}")
+        return None
+
+@search_bp.route('/deep_search', methods=['GET'])
+def search_youtube_endpoint_v2_test():
+
+    BETA_API_KEY = os.getenv('BETA_API_KEY')
+
+    # bearer token 
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        if token != BETA_API_KEY:
+            return jsonify({'error': 'Invalid API key'}), 401
+
+    try:
+        search_query = request.args.get('search', '').strip()
+        if not search_query:
+            return jsonify({'error': 'No search query provided'}), 400
+        
+        timing_info = {}
+        timing_info['query'] = search_query
+        
+        # Time the YouTube scraping
+        videos, scrape_time = scrape_youtube_links(search_query)
+        timing_info['youtube_scraping'] = f"{scrape_time:.2f} seconds"
+        
+        # Process all videos in parallel with timeout and connection limiting
+        all_tutorials = []
+        processing_start = time.time()
+        
+        # Create a semaphore to limit concurrent connections
+        max_concurrent = 25  # Adjust based on your server's capacity
+        semaphore = BoundedSemaphore(max_concurrent)
+        
+        def process_with_semaphore(video):
+            with semaphore:
+                return process_video(video)
+        
+        # Process all videos in parallel with timeout
+        with ThreadPoolExecutor(max_workers=len(videos)) as executor:
+            future_to_video = {
+                executor.submit(process_with_semaphore, video): video 
+                for video in videos
+            }
+            
+            # Collect results with timeout
+            for future in as_completed(future_to_video, timeout=90):
+                try:
+                    result = future.result(timeout=90)  
+                    if result:
+                        all_tutorials.append(result)
+                except TimeoutError:
+                    video = future_to_video[future]
+                    logging.warning(f"Timeout processing video: {video[0]}")
+                    continue
+                except Exception as e:
+                    video = future_to_video[future]
+                    logging.error(f"Error processing video {video[0]}: {str(e)}")
+                    continue
+        
+        processing_time = time.time() - processing_start
+        timing_info['video_processing'] = f"{processing_time:.2f} seconds"
+
+        # Generate comprehensive report using selected LLM
+        if all_tutorials:
+            llm_start = time.time()
+            prompt = (
+                "# Analysis Task\n\n"
+                f"## User Query\n{search_query}\n\n"
+                "## Task Overview\n"
+                "1. First, analyze the user's query to understand:\n"
+                "   - Is this a specific question seeking direct answers?\n"
+                "   - Is this a broad topic requiring synthesis and exploration?\n"
+                "   - What are the key aspects or dimensions that need to be addressed?\n"
+                "   - What would be most valuable to the user based on their query?\n"
+                "   - What deeper implications or connections should be explored?\n\n"
+                "2. Then, without mentioning the type of the user's query, and without mentioning that this is an analysis of video transcripts, structure your response appropriately based on the query type. For example:\n"
+                "   - For specific questions: Provide comprehensive answers with in-depth analysis and multiple perspectives\n"
+                "   - For broad topics: Deliver thorough synthesis with detailed exploration of key themes\n"
+                "   - For comparisons: Examine nuanced differences and complex trade-offs\n"
+                "   - For how-to queries: Include detailed methodology and consideration of edge cases\n\n"
+                "## Content Guidelines\n"
+                " - Create a title for the report that is a summary of the report\n"
+                "- Structure the response in the most logical way for this specific query\n"
+                "- Deeply analyze different perspectives and approaches\n"
+                "- Highlight both obvious and subtle connections between sources\n"
+                "- Examine any contradictions or disagreements in detail\n"
+                "- Draw meaningful conclusions that directly relate to the query\n"
+                "- Consider practical implications and real-world applications\n"
+                "- Explore edge cases and potential limitations\n"
+                "- Identify patterns and trends across sources\n\n"
+                "## Citation and Reference Guidelines\n"
+                "- Include timestamp links whenever referencing specific content\n"
+                "- Add timestamps for:\n"
+                "  * Direct quotes or key statements\n"
+                "  * Important examples or demonstrations\n"
+                "  * Technical explanations or tutorials\n"
+                "  * Expert opinions or insights\n"
+                "  * Supporting evidence for major claims\n"
+                "  * Contrasting viewpoints or approaches\n"
+                "- Format timestamps as markdown links to specific moments in the videos\n"
+                "- Integrate timestamps naturally into the text to maintain readability\n"
+                "- Use multiple timestamps when a point is supported across different sources\n\n"
+                "## Formatting Requirements\n"
+                "- Use proper markdown headers (# for main title, ## for sections)\n"
+                "- Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "- Format quotes with > for blockquotes\n"
+                "- Use **bold** for emphasis\n"
+                "- Ensure all newlines are proper markdown line breaks\n"
+                "- Format timestamps as [MM:SS](video-link) or similar\n\n"
+                "## Source Materials\n"
+                f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
+                "Analyze these materials thoroughly to provide a detailed, well-reasoned response that best serves the user's needs. "
+                "Don't summarize - dig deep into the content and explore all relevant aspects and implications. "
+                "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
+            )
+            
+            model = genai.GenerativeModel("gemini-2.0-flash-lite-preview-02-05")
+            response = model.generate_content(prompt)
+            response_text = response.text if response else None
+            
+            llm_time = time.time() - llm_start
+            timing_info['llm_generation'] = f"{llm_time:.2f} seconds"
+            
+            if response_text:
+                # Get environment and base URL
+                is_dev = os.getenv('APP_ENV') == 'development'
+                base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
+                
+                # Create a mapping of video IDs to source numbers
+                video_id_to_source = {}
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        video_id_to_source[video_id] = i
+
+                # Update timestamp hyperlinks with source numbers
+                def add_source_number(match):
+                    url = match.group(0)
+                    
+                    # Only process links that are actual YouTube timestamp links
+                    if not ('youtu.be' in url and '?t=' in url):
+                        return url
+                        
+                    video_id_match = re.search(r'youtu\.be/([0-9A-Za-z_-]{11})', url)
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        source_num = video_id_to_source.get(video_id)
+                        if source_num:
+                            # Extract the display text (time) from the markdown link
+                            display_text_match = re.search(r'\[(.*?)\]', url)
+                            if not display_text_match:
+                                return url
+                            display_text = display_text_match.group(1)
+                            
+                            # Extract the URL part from the markdown link
+                            url_match = re.search(r'\((.*?)\)', url)
+                            if not url_match:
+                                return url
+                            url_part = url_match.group(1)
+                            
+                            # Verify this is a valid timestamp link before formatting
+                            if display_text and url_part and 'youtu.be' in url_part and '?t=' in url_part:
+                                return f'[({source_num}) {display_text}]({url_part})'
+                        return url
+                    return url
+
+                # Update the regex pattern to only match YouTube timestamp links
+                markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
+
+                # Create sources list instead of appending to markdown
+                sources = []
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    source = {
+                        'number': i,
+                        'title': tutorial['title'],
+                        'url': f'https://youtube.com/watch?v={video_id_match.group(1)}' if video_id_match else tutorial['url']
+                    }
+                    
+                    sources.append(source)
+
+                # Return both markdown content and sources list
+                if markdown_content:
+                    logging.info(timing_info)
+
+                    title = ''
+                    for line in markdown_content.split('\n'):
+                        if line.startswith('# '):
+                            title = line.replace('# ', '').strip()
+                            break
+
+                    return jsonify({
+                        'title': title,
+                        'content': markdown_content,
+                        'sources': sources
+                    }), 200
+                else:
+                    return jsonify({'error': 'Failed to generate report'}), 500
+            
+    except Exception as e:
+        logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500    
