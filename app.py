@@ -2161,105 +2161,28 @@ def search_youtube_endpoint():
                 # Update the regex pattern to only match YouTube timestamp links
                 markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
 
-                # Add the sources section
-                markdown_content += "\n\n## Sources\n"
+                # Create sources list instead of appending to markdown
+                sources = []
                 for i, tutorial in enumerate(all_tutorials, 1):
                     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    source = {
+                        'number': i,
+                        'title': tutorial['title'],
+                        'url': tutorial['url']
+                    }
+                    
                     if video_id_match:
                         video_id = video_id_match.group(1)
-                        note_url = f"{base_url}/?v={video_id}"
-                        markdown_content += f"{i}. [{tutorial['title']}]({note_url})\n"
-                    else:
-                        markdown_content += f"{i}. [{tutorial['title']}]({tutorial['url']})\n"
+                        source['note_url'] = f"{base_url}/?v={video_id}"
+                    
+                    sources.append(source)
 
-                # After generating the markdown content, handle differently for auth vs visitor
+                # Return both markdown content and sources list
                 if markdown_content:
-                    report_id = None
-                    if auth_header:
-                        try:
-                            # ... existing auth user report saving logic ...
-                            # Extract title
-                            title = None
-                            for line in markdown_content.split('\n'):
-                                if line.startswith('# '):
-                                    title = line.replace('# ', '').strip()
-                                    break
-                                if line.startswith('## '):
-                                    title = line.replace('## ', '').strip()
-                                    break
-                            
-                            if not title:
-                                first_line = markdown_content.split('\n')[0].strip()
-                                if first_line:
-                                    title = first_line[:100]
-                                else:
-                                    title = f"Research Report: {search_query[:50]}"
-                            
-                            if not title or len(title.strip()) == 0:
-                                title = f"Research Report: {search_query[:50]}"
-                                
-                            logging.info(f"Extracted title: {title}")
-
-                            # Save to database
-                            conn = get_db_connection()
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    INSERT INTO user_reports 
-                                    (user_id, search_query, title, created_at)
-                                    VALUES (%s, %s, %s, NOW())
-                                    RETURNING id
-                                    """,
-                                    (user_id, search_query, title)
-                                )
-                                report_id = cur.fetchone()[0]
-                                conn.commit()
-
-                            # Save to S3
-                            s3_key = f"reports/{report_id}"
-                            s3_client.put_object(
-                                Bucket=bucket_name,
-                                Key=s3_key,
-                                Body=markdown_content,
-                                ContentType='text/plain'
-                            )
-
-                        except Exception as e:
-                            logging.error(f"Error saving report: {str(e)}")
-                            return jsonify({'error': 'Failed to save report'}), 500
-                    else:
-                        # For visitors, just save to visitor_reports table
-                        try:
-                            conn = get_db_connection()
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    INSERT INTO visitor_reports 
-                                    (visitor_id, search_query)
-                                    VALUES (%s, %s)
-                                    RETURNING id
-                                    """,
-                                    (visitor_id, search_query)
-                                )
-                                report_id = cur.fetchone()[0]
-                                conn.commit()
-
-                                s3_key = f"visitor_reports/{report_id}"
-                                s3_client.put_object(
-                                    Bucket=bucket_name,
-                                    Key=s3_key,
-                                    Body=markdown_content,
-                                    ContentType='text/plain'
-                                )                                
-                        except Exception as e:
-                            logging.error(f"Error saving visitor report: {str(e)}")
-                            # Continue even if saving fails
-
-                    # Add report ID to response headers
-
+                    logging.info(timing_info)
                     return jsonify({
-                        'id': str(report_id),
                         'content': markdown_content,
+                        'sources': sources
                     }), 200
                 else:
                     return jsonify({'error': 'Failed to generate report'}), 500
@@ -2992,14 +2915,25 @@ def process_video(video):
         logging.error(f"Error processing video {video_url}: {str(e)}")
         return None
 
-@app.route('/search_youtube_v2_test', methods=['GET'])
+@app.route('/deep_search', methods=['GET'])
 def search_youtube_endpoint_v2_test():
-    internal_api_key = request.args.get('internal_api_key')
-    if internal_api_key != os.getenv('INTERNAL_API_KEY'):
-        return jsonify({'error': 'Invalid API key'}), 401
+
+    BETA_API_KEY = os.getenv('BETA_API_KEY')
+
+    # bearer token 
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        if token != BETA_API_KEY:
+            return jsonify({'error': 'Invalid API key'}), 401
+
     try:
         search_query = request.args.get('search', '').strip()
+        if not search_query:
+            return jsonify({'error': 'No search query provided'}), 400
+        
         timing_info = {}
+        timing_info['query'] = search_query
         
         # Time the YouTube scraping
         videos, scrape_time = scrape_youtube_links(search_query)
@@ -3150,22 +3084,32 @@ def search_youtube_endpoint_v2_test():
                 # Update the regex pattern to only match YouTube timestamp links
                 markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
 
-                # Add the sources section
-                markdown_content += "\n\n## Sources\n"
+                # Create sources list instead of appending to markdown
+                sources = []
                 for i, tutorial in enumerate(all_tutorials, 1):
                     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
-                    if video_id_match:
-                        video_id = video_id_match.group(1)
-                        note_url = f"{base_url}/?v={video_id}"
-                        markdown_content += f"{i}. [{tutorial['title']}]({note_url})\n"
-                    else:
-                        markdown_content += f"{i}. [{tutorial['title']}]({tutorial['url']})\n"
+                    source = {
+                        'number': i,
+                        'title': tutorial['title'],
+                        'url': f'https://youtube.com/watch?v={video_id_match.group(1)}' if video_id_match else tutorial['url']
+                    }
+                    
+                    sources.append(source)
 
-                # After generating the markdown content, handle differently for auth vs visitor
+                # Return both markdown content and sources list
                 if markdown_content:
+                    logging.info(timing_info)
+
+                    title = ''
+                    for line in markdown_content.split('\n'):
+                        if line.startswith('# '):
+                            title = line.replace('# ', '').strip()
+                            break
+
                     return jsonify({
+                        'title': title,
                         'content': markdown_content,
-                        'timing': timing_info,
+                        'sources': sources
                     }), 200
                 else:
                     return jsonify({'error': 'Failed to generate report'}), 500
