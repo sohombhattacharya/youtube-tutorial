@@ -24,11 +24,16 @@ payments_bp = Blueprint('payments', __name__)
 
 # The webhook secret and API key will be accessed from current_app.config when needed
 @payments_bp.route('/webhook/stripe', methods=['POST'])
-@public_endpoint
 def stripe_webhook():
+    # Add debug logging to verify the request is reaching this point
+    logging.info("Received Stripe webhook request")
+    
     # Get configuration from current_app
     stripe.api_key = current_app.config['STRIPE_SECRET_KEY']
     stripe_endpoint_secret = current_app.config['STRIPE_WEBHOOK_SECRET']
+    
+    # Log headers for debugging
+    logging.info(f"Webhook Headers: {dict(request.headers)}")
     
     logging.info("Stripe webhook received")
     payload = request.data.decode("utf-8")

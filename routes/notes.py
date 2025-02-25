@@ -32,10 +32,11 @@ def generate_tutorial_endpoint():
     logging.debug(f"Request headers: {request.headers}")
     auth_header = request.headers.get('Authorization')
     logging.debug(f"Authorization header: {auth_header}")
-    visitor_id = request.json.get('visitor_id')
 
     subscription_status = 'INACTIVE'  # Default status
     auth0_id = None
+    user_id = None
+    
     # Process Bearer token if present
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
@@ -55,24 +56,25 @@ def generate_tutorial_endpoint():
             conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT subscription_status FROM users WHERE auth0_id = %s",
+                    "SELECT id, subscription_status FROM users WHERE auth0_id = %s",
                     (auth0_id,)
                 )
                 result = cur.fetchone()
                 if result:
-                    subscription_status = result[0]
+                    user_id = result[0]
+                    subscription_status = result[1]
                     
         except Exception as e:
             logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
             # Continue execution with default INACTIVE status
 
-    if auth0_id is None and visitor_id is None:
-        return jsonify({'error': 'Invalid request'}), 400
+    if auth0_id is None:
+        return jsonify({'error': 'Authentication required'}), 401
 
     # Continue with the rest of the endpoint logic
     data = request.json
     video_url = data.get('url')
-    logging.info(f"Received request at /generate_tutorial with video_url: {video_url}, visitor_id: {visitor_id}, user_id: {auth0_id}")
+    logging.info(f"Received request at /generate_tutorial with video_url: {video_url}, user_id: {auth0_id}")
         
     # Extract video ID from the URL
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url)
@@ -82,30 +84,30 @@ def generate_tutorial_endpoint():
     video_id = video_id_match.group(1)
 
     # Check note access only if user is not ACTIVE
-    if subscription_status != 'ACTIVE' and visitor_id:
+    if subscription_status != 'ACTIVE':
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Check if visitor has already viewed this note
+                # Check if user has already viewed this note
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM visitor_notes WHERE visitor_id = %s AND youtube_video_id = %s)",
-                    (visitor_id, video_id)
+                    "SELECT EXISTS(SELECT 1 FROM user_notes WHERE user_id = %s AND youtube_video_url LIKE %s)",
+                    (user_id, f'%{video_id}%')
                 )
                 has_viewed = cur.fetchone()[0]
                 
                 if not has_viewed:
                     # If they haven't viewed it before, check their total note count
-                    cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
+                    cur.execute("SELECT COUNT(*) FROM user_notes WHERE user_id = %s", (user_id,))
                     note_count = cur.fetchone()[0]
                     
                     if note_count >= 3:
                         return jsonify({
                             'error': 'Free note limit reached',
-                            'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
+                            'message': 'You have reached the maximum number of free notes. Please subscribe for unlimited access.'
                         }), 403
 
         except Exception as e:
-            logging.error(f"Database error checking visitor notes: {str(e)}")
+            logging.error(f"Database error checking user notes: {str(e)}")
             return jsonify({'error': 'Internal server error'}), 500
 
     # Create an S3 client
@@ -125,22 +127,27 @@ def generate_tutorial_endpoint():
             s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
             tutorial = s3_response['Body'].read().decode('utf-8')  # Read the markdown content
 
-            # Record the view only if user is not ACTIVE and visitor_id is provided
-            if subscription_status != 'ACTIVE' and visitor_id:
+            # Record the view only if user is not ACTIVE
+            if subscription_status != 'ACTIVE':
                 try:
+                    # Extract title from the tutorial content (first line or first 50 chars)
+                    title = tutorial.split('\n', 1)[0][:50]
+                    if not title:
+                        title = f"YouTube Video {video_id}"
+                    
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute(
                             """
-                            INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
-                            VALUES (%s, %s) 
-                            ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                            INSERT INTO user_notes (user_id, title, youtube_video_url) 
+                            VALUES (%s, %s, %s) 
+                            ON CONFLICT (user_id, youtube_video_url) DO NOTHING
                             """,
-                            (visitor_id, video_id)
+                            (user_id, title, video_url)
                         )
                     conn.commit()
                 except Exception as e:
-                    logging.error(f"Error handling visitor note: {str(e)}")
+                    logging.error(f"Error recording user note: {str(e)}")
                     # Continue execution even if operation fails
                     pass
 
@@ -149,10 +156,9 @@ def generate_tutorial_endpoint():
             # If the markdown does not exist, generate it
             tutorial = transcribe_youtube_video(video_id, video_url)
             
-
-            # log youtube url, visitor id, and title from tutorial 
+            # log youtube url and title from tutorial 
             title = tutorial[:75]
-            logging.info(f"YouTube URL: {video_url}, Visitor ID: {visitor_id}, Title: {title}")
+            logging.info(f"YouTube URL: {video_url}, Title: {title}")
 
             # Upload the markdown to S3
             s3_client.put_object(
@@ -162,22 +168,27 @@ def generate_tutorial_endpoint():
                 ContentType='text/plain'
             )
             
-            # Record the view only if user is not ACTIVE and visitor_id is provided
-            if subscription_status != 'ACTIVE' and visitor_id:
+            # Record the view only if user is not ACTIVE
+            if subscription_status != 'ACTIVE':
                 try:
+                    # Extract title from the tutorial content (first line or first 50 chars)
+                    title = tutorial.split('\n', 1)[0][:50]
+                    if not title:
+                        title = f"YouTube Video {video_id}"
+                    
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute(
                             """
-                            INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
-                            VALUES (%s, %s) 
-                            ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                            INSERT INTO user_notes (user_id, title, youtube_video_url) 
+                            VALUES (%s, %s, %s) 
+                            ON CONFLICT (user_id, youtube_video_url) DO NOTHING
                             """,
-                            (visitor_id, video_id)
+                            (user_id, title, video_url)
                         )
                     conn.commit()
                 except Exception as e:
-                    logging.error(f"Error handling visitor note: {str(e)}")
+                    logging.error(f"Error recording user note: {str(e)}")
                     # Continue execution even if operation fails
                     pass
 
@@ -194,10 +205,11 @@ def get_tutorial():
     
     data = request.json
     video_url = data.get('url')
-    visitor_id = data.get('visitor_id')  # This will always be present
-    is_tldr = data.get('tldr', False)  # New flag to determine if we want TLDR
+    is_tldr = data.get('tldr', False)  # Flag to determine if we want TLDR
     
     subscription_status = 'INACTIVE'  # Default status
+    auth0_id = None
+    user_id = None
     
     # Process Bearer token if present
     if auth_header and auth_header.startswith('Bearer '):
@@ -218,16 +230,20 @@ def get_tutorial():
             conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT subscription_status FROM users WHERE auth0_id = %s",
+                    "SELECT id, subscription_status FROM users WHERE auth0_id = %s",
                     (auth0_id,)
                 )
                 result = cur.fetchone()
                 if result:
-                    subscription_status = result[0]
+                    user_id = result[0]
+                    subscription_status = result[1]
                     
         except Exception as e:
             logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
             # Continue execution with default INACTIVE status
+    
+    if auth0_id is None:
+        return jsonify({'error': 'Authentication required'}), 401
     
     logging.info(f"Received request at /get_tutorial with video_url: {video_url}, tldr: {is_tldr}")
         
@@ -239,30 +255,30 @@ def get_tutorial():
     video_id = video_id_match.group(1)
 
     # Check note access only if user is not ACTIVE
-    if subscription_status != 'ACTIVE' and visitor_id:
+    if subscription_status != 'ACTIVE':
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Check if visitor has already viewed this note
+                # Check if user has already viewed this note
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM visitor_notes WHERE visitor_id = %s AND youtube_video_id = %s)",
-                    (visitor_id, video_id)
+                    "SELECT EXISTS(SELECT 1 FROM user_notes WHERE user_id = %s AND youtube_video_url LIKE %s)",
+                    (user_id, f'%{video_id}%')
                 )
                 has_viewed = cur.fetchone()[0]
                 
                 if not has_viewed:
                     # If they haven't viewed it before, check their total note count
-                    cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
+                    cur.execute("SELECT COUNT(*) FROM user_notes WHERE user_id = %s", (user_id,))
                     note_count = cur.fetchone()[0]
                     
                     if note_count >= 3:
                         return jsonify({
                             'error': 'Free note limit reached',
-                            'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
+                            'message': 'You have reached the maximum number of free notes. Please subscribe for unlimited access.'
                         }), 403
 
         except Exception as e:
-            logging.error(f"Database error checking visitor notes: {str(e)}")
+            logging.error(f"Database error checking user notes: {str(e)}")
             return jsonify({'error': 'Internal server error'}), 500
 
     # Create an S3 client
@@ -282,21 +298,26 @@ def get_tutorial():
         content = s3_response['Body'].read().decode('utf-8')
 
         # Record the view only if user is not ACTIVE
-        if subscription_status != 'ACTIVE' and visitor_id:
+        if subscription_status != 'ACTIVE':
             try:
+                # Extract title from the content (first line or first 50 chars)
+                title = content.split('\n', 1)[0][:50]
+                if not title:
+                    title = f"YouTube Video {video_id}"
+                
                 conn = get_db_connection()
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
-                        VALUES (%s, %s) 
-                        ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                        INSERT INTO user_notes (user_id, title, youtube_video_url) 
+                        VALUES (%s, %s, %s) 
+                        ON CONFLICT (user_id, youtube_video_url) DO NOTHING
                         """,
-                        (visitor_id, video_id)
+                        (user_id, title, video_url)
                     )
                 conn.commit()
             except Exception as e:
-                logging.error(f"Error recording visitor note: {str(e)}")
+                logging.error(f"Error recording user note: {str(e)}")
                 # Continue execution even if this fails
 
         return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
@@ -311,9 +332,10 @@ def generate_tldr_endpoint():
     logging.debug(f"Request headers: {request.headers}")
     auth_header = request.headers.get('Authorization')
     logging.debug(f"Authorization header: {auth_header}")
-    visitor_id = request.json.get('visitor_id')
 
     subscription_status = 'INACTIVE'  # Default status
+    auth0_id = None
+    user_id = None
     
     # Process Bearer token if present
     if auth_header and auth_header.startswith('Bearer '):
@@ -333,16 +355,20 @@ def generate_tldr_endpoint():
             conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT subscription_status FROM users WHERE auth0_id = %s",
+                    "SELECT id, subscription_status FROM users WHERE auth0_id = %s",
                     (auth0_id,)
                 )
                 result = cur.fetchone()
                 if result:
-                    subscription_status = result[0]
+                    user_id = result[0]
+                    subscription_status = result[1]
                     
         except Exception as e:
             logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
             # Continue execution with default INACTIVE status
+
+    if auth0_id is None:
+        return jsonify({'error': 'Authentication required'}), 401
 
     data = request.json
     video_url = data.get('url')
@@ -356,28 +382,30 @@ def generate_tldr_endpoint():
     video_id = video_id_match.group(1)
 
     # Check note access only if user is not ACTIVE
-    if subscription_status != 'ACTIVE' and visitor_id:
+    if subscription_status != 'ACTIVE':
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                # Check if user has already viewed this note
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM visitor_notes WHERE visitor_id = %s AND youtube_video_id = %s)",
-                    (visitor_id, video_id)
+                    "SELECT EXISTS(SELECT 1 FROM user_notes WHERE user_id = %s AND youtube_video_url LIKE %s)",
+                    (user_id, f'%{video_id}%')
                 )
                 has_viewed = cur.fetchone()[0]
                 
                 if not has_viewed:
-                    cur.execute("SELECT COUNT(*) FROM visitor_notes WHERE visitor_id = %s", (visitor_id,))
+                    # If they haven't viewed it before, check their total note count
+                    cur.execute("SELECT COUNT(*) FROM user_notes WHERE user_id = %s", (user_id,))
                     note_count = cur.fetchone()[0]
                     
                     if note_count >= 3:
                         return jsonify({
                             'error': 'Free note limit reached',
-                            'message': 'You have reached the maximum number of free notes. Please sign up for unlimited access.'
+                            'message': 'You have reached the maximum number of free notes. Please subscribe for unlimited access.'
                         }), 403
 
         except Exception as e:
-            logging.error(f"Database error checking visitor notes: {str(e)}")
+            logging.error(f"Database error checking user notes: {str(e)}")
             return jsonify({'error': 'Internal server error'}), 500
 
     s3_client = boto3.client(
@@ -394,21 +422,26 @@ def generate_tldr_endpoint():
             s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
             tldr = s3_response['Body'].read().decode('utf-8')
 
-            if subscription_status != 'ACTIVE' and visitor_id:
+            if subscription_status != 'ACTIVE':
                 try:
+                    # Extract title from the content (first line or first 50 chars)
+                    title = tldr.split('\n', 1)[0][:50]
+                    if not title:
+                        title = f"TLDR: YouTube Video {video_id}"
+                    
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute(
                             """
-                            INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
-                            VALUES (%s, %s) 
-                            ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                            INSERT INTO user_notes (user_id, title, youtube_video_url) 
+                            VALUES (%s, %s, %s) 
+                            ON CONFLICT (user_id, youtube_video_url) DO NOTHING
                             """,
-                            (visitor_id, video_id)
+                            (user_id, title, video_url)
                         )
                     conn.commit()
                 except Exception as e:
-                    logging.error(f"Error handling visitor note: {str(e)}")
+                    logging.error(f"Error recording user note: {str(e)}")
                     pass
 
             return tldr, 200, {'Content-Type': 'text/plain; charset=utf-8'}
@@ -438,21 +471,26 @@ def generate_tldr_endpoint():
                 ContentType='text/plain'
             )
             
-            if subscription_status != 'ACTIVE' and visitor_id:
+            if subscription_status != 'ACTIVE':
                 try:
+                    # Extract title from the content (first line or first 50 chars)
+                    title = tldr.split('\n', 1)[0][:50]
+                    if not title:
+                        title = f"TLDR: YouTube Video {video_id}"
+                    
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute(
                             """
-                            INSERT INTO visitor_notes (visitor_id, youtube_video_id) 
-                            VALUES (%s, %s) 
-                            ON CONFLICT (visitor_id, youtube_video_id) DO NOTHING
+                            INSERT INTO user_notes (user_id, title, youtube_video_url) 
+                            VALUES (%s, %s, %s) 
+                            ON CONFLICT (user_id, youtube_video_url) DO NOTHING
                             """,
-                            (visitor_id, video_id)
+                            (user_id, title, video_url)
                         )
                     conn.commit()
                 except Exception as e:
-                    logging.error(f"Error handling visitor note: {str(e)}")
+                    logging.error(f"Error recording user note: {str(e)}")
                     pass
 
             return tldr, 200, {'Content-Type': 'text/plain; charset=utf-8'}
