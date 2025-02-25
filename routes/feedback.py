@@ -31,39 +31,33 @@ def get_feedback():
         title = data.get('title')
         feedback_text = data.get('feedback')
         was_helpful = data.get('wasHelpful')
-        visitor_id = data.get('visitor_id')
 
         if not youtube_video_id:
             return jsonify({'error': 'YouTube video ID is required'}), 400
 
-        # Initialize auth0_id as None
-        auth0_id = None
-
+        # Check for Bearer token
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        token = auth_header.split(' ')[1]
+        try:
+            decoded_token = jwt.decode(
+                token,
+                auth0_validator.public_key,
+                claims_options={
+                    "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                    "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
+            )
+            auth0_id = decoded_token['sub']
+        except Exception as e:
+            logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
+            return jsonify({'error': 'Invalid authentication token'}), 401
 
         helpful = None
         if was_helpful is not None:
-            helpful = was_helpful    
-        # Check for Bearer token
-        auth_header = request.headers.get('Authorization')
-        if auth_header and auth_header.startswith('Bearer '):
-            token = auth_header.split(' ')[1]
-            try:
-                decoded_token = jwt.decode(
-                    token,
-                    auth0_validator.public_key,
-                    claims_options={
-                        "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
-                        "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
-                    }
-                )
-                auth0_id = decoded_token['sub']
-            except Exception as e:
-                logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
-                # Continue execution to check for visitor_id
-
-        # Verify we have either auth0_id or visitor_id
-        if not auth0_id and not visitor_id:
-            return jsonify({'error': 'Authentication required'}), 401
+            helpful = was_helpful
 
         # Store feedback in database
         conn = get_db_connection()
@@ -71,17 +65,15 @@ def get_feedback():
             cur.execute("""
                 INSERT INTO user_feedback (
                     auth0_id,
-                    visitor_id,
                     youtube_video_id,
                     youtube_video_title,
                     feedback_text,
                     was_helpful,
                     is_tldr
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 auth0_id,
-                visitor_id if not auth0_id else None,  # Only use visitor_id if no auth0_id
                 youtube_video_id,
                 title,
                 feedback_text if feedback_text else None,
@@ -111,58 +103,42 @@ def check_feedback():
         # Get request data
         data = request.json
         youtube_video_id = data.get('video_id')
-        visitor_id = data.get('visitor_id')
         is_tldr = data.get('isTLDR', False)
 
         if not youtube_video_id:
             return jsonify({'error': 'YouTube video ID is required'}), 400
 
-        # Initialize auth0_id as None
-        auth0_id = None
-
         # Check for Bearer token
         auth_header = request.headers.get('Authorization')
-        if auth_header and auth_header.startswith('Bearer '):
-            token = auth_header.split(' ')[1]
-            try:
-                decoded_token = jwt.decode(
-                    token,
-                    auth0_validator.public_key,
-                    claims_options={
-                        "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
-                        "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
-                    }
-                )
-                auth0_id = decoded_token['sub']
-            except Exception as e:
-                logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
-                # Continue execution to check for visitor_id
-
-        # Verify we have either auth0_id or visitor_id
-        if not auth0_id and not visitor_id:
+        if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({'error': 'Authentication required'}), 401
+            
+        token = auth_header.split(' ')[1]
+        try:
+            decoded_token = jwt.decode(
+                token,
+                auth0_validator.public_key,
+                claims_options={
+                    "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                    "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
+            )
+            auth0_id = decoded_token['sub']
+        except Exception as e:
+            logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
+            return jsonify({'error': 'Invalid authentication token'}), 401
 
         # Check for existing feedback in database
         conn = get_db_connection()
         with conn.cursor() as cur:
-            if auth0_id:
-                cur.execute("""
-                    SELECT was_helpful
-                    FROM user_feedback
-                    WHERE auth0_id = %s
-                    AND youtube_video_id = %s
-                    AND is_tldr = %s
-                    LIMIT 1
-                """, (auth0_id, youtube_video_id, is_tldr))
-            else:
-                cur.execute("""
-                    SELECT was_helpful
-                    FROM user_feedback
-                    WHERE visitor_id = %s
-                    AND youtube_video_id = %s
-                    AND is_tldr = %s
-                    LIMIT 1
-                """, (visitor_id, youtube_video_id, is_tldr))
+            cur.execute("""
+                SELECT was_helpful
+                FROM user_feedback
+                WHERE auth0_id = %s
+                AND youtube_video_id = %s
+                AND is_tldr = %s
+                LIMIT 1
+            """, (auth0_id, youtube_video_id, is_tldr))
 
             result = cur.fetchone()
             

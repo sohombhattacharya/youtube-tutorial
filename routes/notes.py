@@ -795,12 +795,6 @@ def get_saved_notes():
             if not user:
                 return jsonify({'error': 'User not found'}), 404
             
-            if user['subscription_status'] != 'ACTIVE':
-                return jsonify({
-                    'error': 'Subscription required',
-                    'message': 'An active subscription is required to access saved notes'
-                }), 403
-
             # Base query parameters
             query_params = [user['id']]
 

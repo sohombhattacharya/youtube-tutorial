@@ -55,12 +55,6 @@ def get_reports():
             if not user:
                 return jsonify({'error': 'User not found'}), 404
             
-            if user['subscription_status'] != 'ACTIVE':
-                return jsonify({
-                    'error': 'Subscription required',
-                    'message': 'An active subscription is required to access reports'
-                }), 403
-
             # Base query parameters
             query_params = [user['id']]
 
@@ -185,12 +179,6 @@ def get_report_by_id(report_id):
             result = cur.fetchone()
             if not result:
                 return jsonify({'error': 'Report not found'}), 404
-            
-            if result['subscription_status'] != 'ACTIVE':
-                return jsonify({
-                    'error': 'Subscription required',
-                    'message': 'An active subscription is required to access reports'
-                }), 403
 
             try:
                 # Get report content from S3
@@ -224,19 +212,47 @@ def get_report_by_id(report_id):
         logging.error(f"Error in get_report_by_id: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
-@reports_bp.route('/get_visitor_reports', methods=['POST'])
-def get_visitor_reports():
-    data = request.json
-    visitor_id = data.get('visitor_id')
-    
-    if not visitor_id:
-        return jsonify({'error': 'Visitor ID is required'}), 400
-        
+@reports_bp.route('/get_free_reports_count', methods=['GET'])
+def get_free_reports_count():
     try:
+        # Get token from Authorization header and decode it
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        token = auth_header.split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+        
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            # Count existing reports for this visitor
-            cur.execute("SELECT COUNT(*) FROM visitor_reports WHERE visitor_id = %s", (visitor_id,))
+            # Check user's subscription status
+            cur.execute("""
+                SELECT id, subscription_status 
+                FROM users 
+                WHERE auth0_id = %s
+            """, (auth0_id,))
+            
+            user = cur.fetchone()
+            if not user:
+                return jsonify({'error': 'User not found'}), 404
+                
+            # If user has active subscription, they have unlimited reports
+            if user['subscription_status'] == 'ACTIVE':
+                return jsonify({
+                    'used_reports': 0,
+                    'total_free_reports': 'unlimited'
+                }), 200
+                
+            # Count existing reports for this user
+            cur.execute("SELECT COUNT(*) FROM user_reports WHERE user_id = %s", (user['id'],))
             used_reports = cur.fetchone()[0]
             
             return jsonify({
@@ -244,8 +260,11 @@ def get_visitor_reports():
                 'total_free_reports': 2
             }), 200
 
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
     except Exception as e:
-        logging.error(f"Database error checking visitor reports: {str(e)}")
+        logging.error(f"Error in get_free_reports_count: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @reports_bp.route('/get_public_report/<string:public_id>', methods=['GET'])
@@ -255,7 +274,7 @@ def get_public_report(public_id):
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             # First check the public_shared_reports table
             cur.execute("""
-                SELECT user_report_id, visitor_report_id
+                SELECT user_report_id
                 FROM public_shared_reports 
                 WHERE id = %s
             """, (public_id,))
@@ -266,41 +285,24 @@ def get_public_report(public_id):
 
             # Initialize variables
             search_query = None
-            user_report_id = None
-            visitor_report_id = None
-            # Check which type of report it is and get the data
-            if shared_report['user_report_id']:
-                cur.execute("""
-                    SELECT id, search_query
-                    FROM user_reports 
-                    WHERE id = %s
-                """, (shared_report['user_report_id'],))
-                report = cur.fetchone()
-                if report:
-                    search_query = report['search_query']
-                    user_report_id = report['id']
-            elif shared_report['visitor_report_id']:
-                cur.execute("""
-                    SELECT id, search_query
-                    FROM visitor_reports 
-                    WHERE id = %s
-                """, (shared_report['visitor_report_id'],))
-                report = cur.fetchone()
-                if report:
-                    search_query = report['search_query']
-                    visitor_report_id = report['id']
+            user_report_id = shared_report['user_report_id']
             
-            if not user_report_id and not visitor_report_id:
+            # Get the report data
+            cur.execute("""
+                SELECT id, search_query
+                FROM user_reports 
+                WHERE id = %s
+            """, (user_report_id,))
+            report = cur.fetchone()
+            if not report:
                 return jsonify({'error': 'Report data not found'}), 404
+                
+            search_query = report['search_query']
 
             try:
                 # Get report content from S3
-
-                if user_report_id:
-                    s3_key = f"reports/{user_report_id}"
-                elif visitor_report_id:
-                    s3_key = f"visitor_reports/{visitor_report_id}"
-
+                s3_key = f"reports/{user_report_id}"
+                
                 s3_client = boto3.client(
                     's3',
                     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -311,8 +313,6 @@ def get_public_report(public_id):
                 s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
                 content = s3_response['Body'].read().decode('utf-8')
                 
-                # Create response with headers
-
                 return jsonify({
                     'search_query': search_query,
                     'content': content,
@@ -329,80 +329,48 @@ def get_public_report(public_id):
 @reports_bp.route('/create_public_report', methods=['POST'])
 def create_public_report():
     try:
+        # Get token from Authorization header and decode it
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        token = auth_header.split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+        
         data = request.json
         report_id = data.get('report_id')
-        visitor_id = data.get('visitor_id')
         
         if not report_id:
             return jsonify({'error': 'Report ID is required'}), 400
 
-        # Initialize variables
-        auth0_id = None
-        subscription_status = 'INACTIVE'
-
-        # Check for Bearer token
-        auth_header = request.headers.get('Authorization')
-        if auth_header and auth_header.startswith('Bearer '):
-            token = auth_header.split(' ')[1]
-            try:
-                decoded_token = jwt.decode(
-                    token,
-                    auth0_validator.public_key,
-                    claims_options={
-                        "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
-                        "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
-                    }
-                )
-                auth0_id = decoded_token['sub']
-            except Exception as e:
-                logging.error(f"Error processing token: {type(e).__name__}: {str(e)}")
-                # Continue with visitor_id flow
-
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            # If we have an auth0_id, check subscription status
-            if auth0_id:
-                cur.execute("""
-                    SELECT subscription_status 
-                    FROM users 
-                    WHERE auth0_id = %s
-                """, (auth0_id,))
-                result = cur.fetchone()
-                if result:
-                    subscription_status = result['subscription_status']
-
-            # Determine which type of report to look for based on subscription status
-            if subscription_status == 'ACTIVE':
-                cur.execute("""
-                    SELECT r.id 
-                    FROM user_reports r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE r.id = %s AND u.auth0_id = %s
-                """, (report_id, auth0_id))
-                is_visitor_report = False
-            else:
-                if not visitor_id:
-                    return jsonify({'error': 'Visitor ID is required'}), 400
-                cur.execute("""
-                    SELECT id 
-                    FROM visitor_reports 
-                    WHERE id = %s
-                """, (report_id,))
-                is_visitor_report = True
-
-            report = cur.fetchone()
-            if not report:
-                return jsonify({'error': 'Report not found'}), 404
-
+            # Verify report ownership (but don't check subscription status)
+            cur.execute("""
+                SELECT r.id 
+                FROM user_reports r
+                JOIN users u ON r.user_id = u.id
+                WHERE r.id = %s AND u.auth0_id = %s
+            """, (report_id, auth0_id))
+            
+            result = cur.fetchone()
+            if not result:
+                return jsonify({'error': 'Report not found or not owned by user'}), 404
+            
             # Check for existing public share
             cur.execute("""
                 SELECT id
                 FROM public_shared_reports
-                WHERE user_report_id = %s OR visitor_report_id = %s
-            """, (
-                report_id if not is_visitor_report else None,
-                report_id if is_visitor_report else None
-            ))
+                WHERE user_report_id = %s
+            """, (report_id,))
             
             existing_share = cur.fetchone()
             if existing_share:
@@ -414,13 +382,10 @@ def create_public_report():
             try:
                 cur.execute("""
                     INSERT INTO public_shared_reports 
-                    (user_report_id, visitor_report_id, created_at)
-                    VALUES (%s, %s, NOW())
+                    (user_report_id, created_at)
+                    VALUES (%s, NOW())
                     RETURNING id
-                """, (
-                    None if is_visitor_report else report_id,
-                    report_id if is_visitor_report else None
-                ))
+                """, (report_id,))
                 conn.commit()
                 
                 public_id = cur.fetchone()['id']
@@ -433,6 +398,9 @@ def create_public_report():
                 logging.error(f"Database error creating public share: {str(e)}")
                 return jsonify({'error': 'Failed to create public share'}), 500
 
+    except jwt.InvalidTokenError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
     except Exception as e:
         logging.error(f"Error in create_public_report: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500    

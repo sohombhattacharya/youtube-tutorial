@@ -33,81 +33,73 @@ search_bp = Blueprint('search', __name__)
 def search_youtube_endpoint():
     try:
         auth_header = request.headers.get('Authorization')
-        visitor_id = request.args.get('visitor_id')
         search_query = request.args.get('query')
         
         if not search_query:
             return jsonify({'error': 'Search query is required'}), 400
 
-        # Handle authenticated users first
-        if auth_header and auth_header.startswith('Bearer '):
-            # ... existing auth user logic ...
-            token = auth_header.split(' ')[1]
-            try:
-                decoded_token = jwt.decode(
-                    token,
-                    auth0_validator.public_key,
-                    claims_options={
-                        "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
-                        "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
-                    }
-                )
-                auth0_id = decoded_token['sub']
+        # Require authentication
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
 
-                # Check user's subscription status and get user_id
-                conn = get_db_connection()
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT id, subscription_status 
-                        FROM users 
-                        WHERE auth0_id = %s
-                        """,
-                        (auth0_id,)
-                    )
-                    result = cur.fetchone()
-                    if not result or result[1] != 'ACTIVE':
-                        return jsonify({
-                            'error': 'Subscription required',
-                            'message': 'An active subscription is required to use this feature'
-                        }), 403
-                    user_id = result[0]
+        # Process authentication token
+        token = auth_header.split(' ')[1]
+        try:
+            decoded_token = jwt.decode(
+                token,
+                auth0_validator.public_key,
+                claims_options={
+                    "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                    "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
+            )
+            auth0_id = decoded_token['sub']
 
-            except Exception as e:
-                logging.error(f"Error verifying token: {str(e)}")
-                return jsonify({'error': 'Authentication error'}), 401
-
-        # If no auth header, check visitor_id and their report limit
-        elif not visitor_id:
-            return jsonify({'error': 'Authentication or visitor ID required'}), 401
-        else:
-            # Check if visitor has already generated a report
+            # Check user's subscription status and get user_id
             conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT COUNT(*) 
-                    FROM visitor_reports 
-                    WHERE visitor_id = %s
+                    SELECT id, subscription_status 
+                    FROM users 
+                    WHERE auth0_id = %s
                     """,
-                    (visitor_id,)
+                    (auth0_id,)
                 )
-                report_count = cur.fetchone()[0]
+                result = cur.fetchone()
+                if not result:
+                    return jsonify({'error': 'User not found'}), 404
                 
-                if report_count >= 2:
-                    return jsonify({
-                        'error': 'Report limit reached',
-                        'message': 'You have reached the maximum number of free reports. Please sign up for unlimited access.'
-                    }), 403
+                user_id = result[0]
+                subscription_status = result[1]
+                
+                # For non-subscribed users, check report limit
+                if subscription_status != 'ACTIVE':
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) 
+                        FROM user_reports 
+                        WHERE user_id = %s
+                        """,
+                        (user_id,)
+                    )
+                    report_count = cur.fetchone()[0]
+                    
+                    if report_count >= 2:
+                        return jsonify({
+                            'error': 'Report limit reached',
+                            'message': 'You have reached the maximum number of free reports. Please subscribe for unlimited access.'
+                        }), 403
+
+        except Exception as e:
+            logging.error(f"Error verifying token: {str(e)}")
+            return jsonify({'error': 'Authentication error'}), 401
 
         # Replace with your actual API key
         API_KEY = os.getenv('GOOGLE_API_KEY')
         
         # Log info for request
-        if auth_header:
-            logging.info(f"Received request at /search_youtube with query: {search_query} from user {auth0_id}")
-        else:
-            logging.info(f"Received request at /search_youtube with query: {search_query} from visitor {visitor_id}")
+        logging.info(f"Received request at /search_youtube with query: {search_query} from user {auth0_id}")
 
         # Search YouTube with 25 results
         videos = search_youtube(search_query, API_KEY, max_results=25)
@@ -266,7 +258,7 @@ def search_youtube_endpoint():
                 # Update the regex pattern to only match YouTube timestamp links
                 markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
 
-               # Add the sources section
+                # Add the sources section
                 markdown_content += "\n\n## Sources\n"
                 for i, tutorial in enumerate(all_tutorials, 1):
                     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
@@ -278,95 +270,63 @@ def search_youtube_endpoint():
                     else:
                         markdown_content += f"{i}. [{tutorial['title']}]({tutorial['url']})\n"
 
-                # After generating the markdown content, handle differently for auth vs visitor
+                # After generating the markdown content, save the report
                 if markdown_content:
                     report_id = None
-                    if auth_header:
-                        try:
-                            # ... existing auth user report saving logic ...
-                            # Extract title
-                            title = None
-                            for line in markdown_content.split('\n'):
-                                if line.startswith('# '):
-                                    title = line.replace('# ', '').strip()
-                                    break
-                                if line.startswith('## '):
-                                    title = line.replace('## ', '').strip()
-                                    break
-                            
-                            if not title:
-                                first_line = markdown_content.split('\n')[0].strip()
-                                if first_line:
-                                    title = first_line[:100]
-                                else:
-                                    title = f"Research Report: {search_query[:50]}"
-                            
-                            if not title or len(title.strip()) == 0:
+                    try:
+                        # Extract title
+                        title = None
+                        for line in markdown_content.split('\n'):
+                            if line.startswith('# '):
+                                title = line.replace('# ', '').strip()
+                                break
+                            if line.startswith('## '):
+                                title = line.replace('## ', '').strip()
+                                break
+                        
+                        if not title:
+                            first_line = markdown_content.split('\n')[0].strip()
+                            if first_line:
+                                title = first_line[:100]
+                            else:
                                 title = f"Research Report: {search_query[:50]}"
-                                
-                            logging.info(f"Extracted title: {title}")
+                        
+                        if not title or len(title.strip()) == 0:
+                            title = f"Research Report: {search_query[:50]}"
+                            
+                        logging.info(f"Extracted title: {title}")
 
-                            # Save to database
-                            conn = get_db_connection()
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    INSERT INTO user_reports 
-                                    (user_id, search_query, title, created_at)
-                                    VALUES (%s, %s, %s, NOW())
-                                    RETURNING id
-                                    """,
-                                    (user_id, search_query, title)
-                                )
-                                report_id = cur.fetchone()[0]
-                                conn.commit()
-
-                            # Save to S3
-                            s3_key = f"reports/{report_id}"
-                            s3_client.put_object(
-                                Bucket=bucket_name,
-                                Key=s3_key,
-                                Body=markdown_content,
-                                ContentType='text/plain'
+                        # Save to database
+                        conn = get_db_connection()
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO user_reports 
+                                (user_id, search_query, title, created_at)
+                                VALUES (%s, %s, %s, NOW())
+                                RETURNING id
+                                """,
+                                (user_id, search_query, title)
                             )
+                            report_id = cur.fetchone()[0]
+                            conn.commit()
 
-                        except Exception as e:
-                            logging.error(f"Error saving report: {str(e)}")
-                            return jsonify({'error': 'Failed to save report'}), 500
-                    else:
-                        # For visitors, just save to visitor_reports table
-                        try:
-                            conn = get_db_connection()
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    INSERT INTO visitor_reports 
-                                    (visitor_id, search_query)
-                                    VALUES (%s, %s)
-                                    RETURNING id
-                                    """,
-                                    (visitor_id, search_query)
-                                )
-                                report_id = cur.fetchone()[0]
-                                conn.commit()
+                        # Save to S3
+                        s3_key = f"reports/{report_id}"
+                        s3_client.put_object(
+                            Bucket=bucket_name,
+                            Key=s3_key,
+                            Body=markdown_content,
+                            ContentType='text/plain'
+                        )
 
-                                s3_key = f"visitor_reports/{report_id}"
-                                s3_client.put_object(
-                                    Bucket=bucket_name,
-                                    Key=s3_key,
-                                    Body=markdown_content,
-                                    ContentType='text/plain'
-                                )                                
-                        except Exception as e:
-                            logging.error(f"Error saving visitor report: {str(e)}")
-                            # Continue even if saving fails
-
-                    # Add report ID to response headers
+                    except Exception as e:
+                        logging.error(f"Error saving report: {str(e)}")
+                        return jsonify({'error': 'Failed to save report'}), 500
 
                     return jsonify({
                         'id': str(report_id),
                         'content': markdown_content,
-
                     }), 200
                 else:
                     return jsonify({'error': 'Failed to generate report'}), 500
@@ -374,6 +334,7 @@ def search_youtube_endpoint():
     except Exception as e:
         logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
+
 def search_youtube(query, api_key, max_results=10):
     """
     Search YouTube for videos matching the query and return their URLs and titles.
