@@ -126,5 +126,5 @@ CREATE TABLE note_generation_history (
     youtube_video_url TEXT NOT NULL,
     note_type TEXT NOT NULL,
     generated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(user_id, youtube_video_id)
+    UNIQUE(user_id, youtube_video_id, note_type)
 );

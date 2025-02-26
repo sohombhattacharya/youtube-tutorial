@@ -140,7 +140,7 @@ def generate_tutorial_endpoint():
                         """
                         INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
                         VALUES (%s, %s, %s, %s) 
-                        ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                        ON CONFLICT (user_id, youtube_video_id, note_type) DO NOTHING
                         """,
                         (user_id, video_id, video_url, 'tutorial')
                     )
@@ -176,7 +176,7 @@ def generate_tutorial_endpoint():
                         """
                         INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
                         VALUES (%s, %s, %s, %s) 
-                        ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                        ON CONFLICT (user_id, youtube_video_id, note_type) DO NOTHING
                         """,
                         (user_id, video_id, video_url, 'tutorial')
                     )
@@ -305,7 +305,7 @@ def get_tutorial():
                     """
                     INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
                     VALUES (%s, %s, %s, %s) 
-                    ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                    ON CONFLICT (user_id, youtube_video_id, note_type) DO NOTHING
                     """,
                     (user_id, video_id, video_url, note_type)
                 )
@@ -430,7 +430,7 @@ def generate_tldr_endpoint():
                         """
                         INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
                         VALUES (%s, %s, %s, %s) 
-                        ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                        ON CONFLICT (user_id, youtube_video_id, note_type) DO NOTHING
                         """,
                         (user_id, video_id, video_url, 'tldr')
                     )
@@ -476,7 +476,7 @@ def generate_tldr_endpoint():
                         """
                         INSERT INTO note_generation_history (user_id, youtube_video_id, youtube_video_url, note_type) 
                         VALUES (%s, %s, %s, %s) 
-                        ON CONFLICT (user_id, youtube_video_id) DO NOTHING
+                        ON CONFLICT (user_id, youtube_video_id, note_type) DO NOTHING
                         """,
                         (user_id, video_id, video_url, 'tldr')
                     )
