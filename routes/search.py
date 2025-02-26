@@ -44,6 +44,7 @@ def search_youtube_endpoint():
 
         # Process authentication token
         token = auth_header.split(' ')[1]
+        subscription_status = None
         try:
             decoded_token = jwt.decode(
                 token,
@@ -91,10 +92,96 @@ def search_youtube_endpoint():
                             'error': 'Report limit reached',
                             'message': 'You have reached the maximum number of free reports for this month. Please subscribe for unlimited access.'
                         }), 403
+                else:
+                    # For subscribed users, check the 10 reports per month limit
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) 
+                        FROM user_reports 
+                        WHERE user_id = %s
+                        AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+                        """,
+                        (user_id,)
+                    )
+                    report_count = cur.fetchone()[0]
+                    
+                    if report_count >= 10:
+                        return jsonify({
+                            'error': 'Report limit reached',
+                            'message': 'You have reached the maximum number of 10 reports for this month.'
+                        }), 403
 
         except Exception as e:
             logging.error(f"Error verifying token: {str(e)}")
             return jsonify({'error': 'Authentication error'}), 401
+
+        if subscription_status == 'ACTIVE':
+            fast_search_response = fast_search_youtube(search_query)
+            
+            # Check if fast search was successful
+            if fast_search_response and 'error' not in fast_search_response:
+                # Get environment and base URL for source links
+                is_dev = os.getenv('APP_ENV') == 'development'
+                base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
+                
+                # Save the report to database and S3
+                try:
+                    # Extract title
+                    title = fast_search_response.get('title', f"Research Report: {search_query[:50]}")
+                    
+                    # Save to database
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO user_reports 
+                            (user_id, search_query, title, created_at)
+                            VALUES (%s, %s, %s, NOW())
+                            RETURNING id
+                            """,
+                            (user_id, search_query, title)
+                        )
+                        report_id = cur.fetchone()[0]
+                        conn.commit()
+
+                    # Save to S3
+                    s3_client = boto3.client(
+                        's3',
+                        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                    )
+                    bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                    s3_key = f"reports/{report_id}"
+                    
+                    # Add sources section to markdown content
+                    markdown_content = fast_search_response['content']
+                    markdown_content += "\n\n## Sources\n"
+                    for source in fast_search_response['sources']:
+                        video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', source['url'])
+                        if video_id_match:
+                            video_id = video_id_match.group(1)
+                            note_url = f"{base_url}/?v={video_id}"
+                            markdown_content += f"{source['number']}. [{source['title']}]({note_url})\n"
+                        else:
+                            markdown_content += f"{source['number']}. [{source['title']}]({source['url']})\n"
+                    
+                    s3_client.put_object(
+                        Bucket=bucket_name,
+                        Key=s3_key,
+                        Body=markdown_content,
+                        ContentType='text/plain'
+                    )
+
+                    return jsonify({
+                        'id': str(report_id),
+                        'content': markdown_content,
+                    }), 200
+                    
+                except Exception as e:
+                    logging.error(f"Error saving fast search report: {str(e)}")
+                    # Continue with regular search if fast search fails to save
+            else: 
+                return jsonify({'error': 'Failed to generate report'}), 500
 
         # Replace with your actual API key
         API_KEY = os.getenv('GOOGLE_API_KEY')
@@ -727,10 +814,6 @@ def search_youtube_endpoint_v2_test():
             timing_info['llm_generation'] = f"{llm_time:.2f} seconds"
             
             if response_text:
-                # Get environment and base URL
-                is_dev = os.getenv('APP_ENV') == 'development'
-                base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
-                
                 # Create a mapping of video IDs to source numbers
                 video_id_to_source = {}
                 for i, tutorial in enumerate(all_tutorials, 1):
@@ -806,3 +889,185 @@ def search_youtube_endpoint_v2_test():
     except Exception as e:
         logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500    
+    
+def fast_search_youtube(search_query):
+        logging.info(f"Starting fast search for {search_query}")
+        timing_info = {}
+        timing_info['query'] = search_query
+        
+        # Time the YouTube scraping
+        videos, scrape_time = scrape_youtube_links(search_query)
+        logging.info(f"Scraping time: {scrape_time:.2f} seconds")
+        timing_info['youtube_scraping'] = f"{scrape_time:.2f} seconds"
+        
+        # Process all videos in parallel with timeout and connection limiting
+        all_tutorials = []
+        processing_start = time.time()
+        
+        # Create a semaphore to limit concurrent connections
+        max_concurrent = 25  # Adjust based on your server's capacity
+        semaphore = BoundedSemaphore(max_concurrent)
+        
+        def process_with_semaphore(video):
+            with semaphore:
+                return process_video(video)
+        
+        # Process all videos in parallel with timeout
+        with ThreadPoolExecutor(max_workers=len(videos)) as executor:
+            future_to_video = {
+                executor.submit(process_with_semaphore, video): video 
+                for video in videos
+            }
+            
+            # Collect results with timeout
+            for future in as_completed(future_to_video, timeout=90):
+                try:
+                    result = future.result(timeout=90)  
+                    if result:
+                        all_tutorials.append(result)
+                except TimeoutError:
+                    video = future_to_video[future]
+                    logging.warning(f"Timeout processing video: {video[0]}")
+                    continue
+                except Exception as e:
+                    video = future_to_video[future]
+                    logging.error(f"Error processing video {video[0]}: {str(e)}")
+                    continue
+        
+        processing_time = time.time() - processing_start
+        timing_info['video_processing'] = f"{processing_time:.2f} seconds"
+
+        # Generate comprehensive report using selected LLM
+        if all_tutorials:
+            llm_start = time.time()
+            prompt = (
+                "# Analysis Task\n\n"
+                f"## User Query\n{search_query}\n\n"
+                "## Task Overview\n"
+                "1. First, analyze the user's query to understand:\n"
+                "   - Is this a specific question seeking direct answers?\n"
+                "   - Is this a broad topic requiring synthesis and exploration?\n"
+                "   - What are the key aspects or dimensions that need to be addressed?\n"
+                "   - What would be most valuable to the user based on their query?\n"
+                "   - What deeper implications or connections should be explored?\n\n"
+                "2. Then, without mentioning the type of the user's query, and without mentioning that this is an analysis of video transcripts, structure your response appropriately based on the query type. For example:\n"
+                "   - For specific questions: Provide comprehensive answers with in-depth analysis and multiple perspectives\n"
+                "   - For broad topics: Deliver thorough synthesis with detailed exploration of key themes\n"
+                "   - For comparisons: Examine nuanced differences and complex trade-offs\n"
+                "   - For how-to queries: Include detailed methodology and consideration of edge cases\n\n"
+                "## Content Guidelines\n"
+                " - Create a title for the report that is a summary of the report\n"
+                "- Structure the response in the most logical way for this specific query\n"
+                "- Deeply analyze different perspectives and approaches\n"
+                "- Highlight both obvious and subtle connections between sources\n"
+                "- Examine any contradictions or disagreements in detail\n"
+                "- Draw meaningful conclusions that directly relate to the query\n"
+                "- Consider practical implications and real-world applications\n"
+                "- Explore edge cases and potential limitations\n"
+                "- Identify patterns and trends across sources\n\n"
+                "## Citation and Reference Guidelines\n"
+                "- Include timestamp links whenever referencing specific content\n"
+                "- Add timestamps for:\n"
+                "  * Direct quotes or key statements\n"
+                "  * Important examples or demonstrations\n"
+                "  * Technical explanations or tutorials\n"
+                "  * Expert opinions or insights\n"
+                "  * Supporting evidence for major claims\n"
+                "  * Contrasting viewpoints or approaches\n"
+                "- Format timestamps as markdown links to specific moments in the videos\n"
+                "- Integrate timestamps naturally into the text to maintain readability\n"
+                "- Use multiple timestamps when a point is supported across different sources\n\n"
+                "## Formatting Requirements\n"
+                "- Use proper markdown headers (# for main title, ## for sections)\n"
+                "- Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "- Format quotes with > for blockquotes\n"
+                "- Use **bold** for emphasis\n"
+                "- Ensure all newlines are proper markdown line breaks\n"
+                "- Format timestamps as [MM:SS](video-link) or similar\n\n"
+                "## Source Materials\n"
+                f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
+                "Analyze these materials thoroughly to provide a detailed, well-reasoned response that best serves the user's needs. "
+                "Don't summarize - dig deep into the content and explore all relevant aspects and implications. "
+                "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
+            )
+            
+            model = genai.GenerativeModel("gemini-2.0-flash-lite")
+            response = model.generate_content(prompt)
+            response_text = response.text if response else None
+            
+            llm_time = time.time() - llm_start
+            timing_info['llm_generation'] = f"{llm_time:.2f} seconds"
+            
+            if response_text:
+                
+                # Create a mapping of video IDs to source numbers
+                video_id_to_source = {}
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        video_id_to_source[video_id] = i
+
+                # Update timestamp hyperlinks with source numbers
+                def add_source_number(match):
+                    url = match.group(0)
+                    
+                    # Only process links that are actual YouTube timestamp links
+                    if not ('youtu.be' in url and '?t=' in url):
+                        return url
+                        
+                    video_id_match = re.search(r'youtu\.be/([0-9A-Za-z_-]{11})', url)
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        source_num = video_id_to_source.get(video_id)
+                        if source_num:
+                            # Extract the display text (time) from the markdown link
+                            display_text_match = re.search(r'\[(.*?)\]', url)
+                            if not display_text_match:
+                                return url
+                            display_text = display_text_match.group(1)
+                            
+                            # Extract the URL part from the markdown link
+                            url_match = re.search(r'\((.*?)\)', url)
+                            if not url_match:
+                                return url
+                            url_part = url_match.group(1)
+                            
+                            # Verify this is a valid timestamp link before formatting
+                            if display_text and url_part and 'youtu.be' in url_part and '?t=' in url_part:
+                                return f'[({source_num}) {display_text}]({url_part})'
+                        return url
+                    return url
+
+                # Update the regex pattern to only match YouTube timestamp links
+                markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
+
+                # Create sources list instead of appending to markdown
+                sources = []
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    source = {
+                        'number': i,
+                        'title': tutorial['title'],
+                        'url': f'https://youtube.com/watch?v={video_id_match.group(1)}' if video_id_match else tutorial['url']
+                    }
+                    
+                    sources.append(source)
+
+                # Return both markdown content and sources list
+                if markdown_content:
+                    logging.info(timing_info)
+
+                    title = ''
+                    for line in markdown_content.split('\n'):
+                        if line.startswith('# '):
+                            title = line.replace('# ', '').strip()
+                            break
+
+                    return {
+                        'title': title,
+                        'content': markdown_content,
+                        'sources': sources
+                    }
+                else:
+                    return {'error': 'Failed to generate report'}

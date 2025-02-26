@@ -958,8 +958,8 @@ def delete_note():
         logging.error(f"Error in delete_note: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
-@notes_bp.route('/get_free_monthly_usage', methods=['GET'])
-def get_free_monthly_usage():
+@notes_bp.route('/get_monthly_usage', methods=['GET'])
+def get_monthly_usage():
     try:
         # Get token from Authorization header and decode it
         auth_header = request.headers.get('Authorization')
@@ -993,8 +993,13 @@ def get_free_monthly_usage():
             user_id = user['id']
             subscription_status = user['subscription_status']
             
-            notes_limit = 2  # 2 notes per month for free users
-            reports_limit = 2  # 2 reports per month for free users
+            # Set limits based on subscription status
+            if subscription_status == 'ACTIVE':
+                notes_limit = float('inf')  # Unlimited notes for active users
+                reports_limit = 10  # 10 reports per month for active users
+            else:
+                notes_limit = 2  # 2 notes per month for free users
+                reports_limit = 2  # 2 reports per month for free users
             
             # Count notes generated this month
             cur.execute("""
@@ -1014,16 +1019,21 @@ def get_free_monthly_usage():
             """, (user_id,))
             reports_used = cur.fetchone()[0]
             
+            # Format the response with appropriate limits
+            notes_response = {
+                'used': notes_used,
+                'is_active': subscription_status == 'ACTIVE'
+            }
+            
+            # Only include limit for free users, as paid users have unlimited notes
+            if subscription_status != 'ACTIVE':
+                notes_response['limit'] = notes_limit
+            
             return jsonify({
-                'notes': {
-                    'used': notes_used,
-                    'limit': notes_limit,
-                    'unlimited': subscription_status == 'ACTIVE'
-                },
+                'notes': notes_response,
                 'reports': {
                     'used': reports_used,
                     'limit': reports_limit,
-                    'unlimited': subscription_status == 'ACTIVE'
                 },
             }), 200
 
