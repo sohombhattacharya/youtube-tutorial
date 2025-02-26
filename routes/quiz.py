@@ -112,7 +112,7 @@ def generate_quiz():
         f"Markdown Content:\n{markdown_content}"
     )
     
-    model = genai.GenerativeModel("gemini-2.0-flash-lite-preview-02-05")
+    model = genai.GenerativeModel("gemini-2.0-flash-lite")
     response = model.generate_content(prompt)
     
     if response and response.text:
