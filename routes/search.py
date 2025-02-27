@@ -692,7 +692,7 @@ def process_video(video):
         return None
 
 @search_bp.route('/deep_search', methods=['GET'])
-def search_youtube_endpoint_v2():
+def deep_search():
     start_time = time.time()
     api_key = None
     try:
@@ -713,7 +713,7 @@ def search_youtube_endpoint_v2():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT api_keys.id, api_keys.user_id, users.subscription_status
+                    SELECT api_keys.id, api_keys.user_id, users.subscription_status, users.product_id
                     FROM api_keys
                     JOIN users ON api_keys.user_id = users.id
                     WHERE api_keys.api_key = %s
@@ -725,13 +725,44 @@ def search_youtube_endpoint_v2():
                 if not result:
                     return jsonify({'error': 'Invalid API key'}), 401
                 
-                api_key_id = result[0]
-                user_id = result[1]
                 subscription_status = result[2]
+                subscription_product_id = result[3]
                 
-                # Check if user has an active subscription
+                # Check credit limits based on subscription status
+                # Get current month's credit usage
+                cur.execute(
+                    """
+                    SELECT SUM(credits_used) 
+                    FROM api_calls 
+                    WHERE api_key = %s 
+                    AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+                    """,
+                    (api_key,)
+                )
+                current_usage = cur.fetchone()[0] or 0
+                
+                # Credits for this call
+                credits_for_this_call = 100
+                
+                # Define credit limits based on subscription
+                PRO_PLAN_PRODUCT_ID = os.getenv('PRO_PLAN_PRODUCT_ID')
+                
                 if subscription_status != 'ACTIVE':
-                    return jsonify({'error': 'Active subscription required'}), 403
+                    # Free user - 500 credits/month
+                    if current_usage + credits_for_this_call > 500:
+                        return jsonify({
+                            'error': 'Credit limit reached',
+                            'message': 'This call would exceed your monthly limit of 500 credits. Please upgrade for higher volume needs.'
+                        }), 403
+                elif subscription_product_id == PRO_PLAN_PRODUCT_ID:
+                    # Pro user - 1500 credits/month
+                    if current_usage + credits_for_this_call > 1500:
+                        return jsonify({
+                            'error': 'Credit limit reached',
+                            'message': 'This call would exceed your monthly limit of 1500 credits. Please upgrade for higher volume needs.'
+                        }), 403
+                # If user has an active subscription but not Pro, they were already checked above
+                # for the basic subscription status check
 
         search_query = request.args.get('search', '').strip()
         if not search_query:
@@ -925,6 +956,56 @@ def search_youtube_endpoint_v2():
                         if line.startswith('# '):
                             title = line.replace('# ', '').strip()
                             break
+
+                    # Store response in S3 for auditing
+                    try:
+                        s3_client = boto3.client(
+                            's3',
+                            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                        )
+                        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                        
+                        # Create a unique key for the response
+                        timestamp = int(time.time())
+                        s3_key = f"api_responses/{api_key}/{timestamp}_{search_query[:50].replace(' ', '_')}.json"
+                        
+                        # Prepare response data
+                        response_data = {
+                            'title': title,
+                            'content': markdown_content,
+                            'sources': sources,
+                            'query': search_query,
+                            'timestamp': timestamp,
+                            'api_key': api_key,
+                            'timing_info': timing_info
+                        }
+                        
+                        # Store in S3
+                        s3_client.put_object(
+                            Bucket=bucket_name,
+                            Key=s3_key,
+                            Body=json.dumps(response_data),
+                            ContentType='application/json'
+                        )
+                        
+                        # Update the database with the S3 path
+                        if not is_beta_key:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    UPDATE api_calls 
+                                    SET response_s3_path = %s
+                                    WHERE api_key = %s AND created_at = (
+                                        SELECT MAX(created_at) FROM api_calls WHERE api_key = %s
+                                    )
+                                    """,
+                                    (s3_key, api_key, api_key)
+                                )
+                                conn.commit()
+                    except Exception as e:
+                        logging.error(f"Error storing API response in S3: {str(e)}")
+                        # Continue even if S3 storage fails
 
                     return jsonify({
                         'title': title,

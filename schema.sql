@@ -147,7 +147,9 @@ CREATE TABLE api_calls (
     status_code INTEGER NOT NULL,
     credits_used INTEGER NOT NULL,
     request_ip VARCHAR(45),
-    request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    request_timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     response_time_ms INTEGER,
     CONSTRAINT fk_api_key FOREIGN KEY (api_key) REFERENCES api_keys(api_key) ON DELETE CASCADE
 );
+
+ALTER TABLE users ADD COLUMN product_id TEXT;
