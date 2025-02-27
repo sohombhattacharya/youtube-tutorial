@@ -53,6 +53,7 @@ def create_app(config_name=APP_ENV):
     from routes.payments import payments_bp
     from routes.feedback import feedback_bp
     from routes.quiz import quiz_bp
+    from routes.api_customer import api_customer_bp
 
     app.register_blueprint(search_bp)
     app.register_blueprint(user_bp)
@@ -61,6 +62,8 @@ def create_app(config_name=APP_ENV):
     app.register_blueprint(payments_bp)
     app.register_blueprint(feedback_bp)
     app.register_blueprint(quiz_bp)
+    app.register_blueprint(api_customer_bp)
+        
     return app
 
 app = create_app()

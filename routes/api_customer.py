@@ -11,6 +11,36 @@ api_customer_bp = Blueprint('api_customer', __name__)
 
 @api_customer_bp.route('/create_api_key', methods=['POST'])
 def create_api_key():
+    """
+    Create a new API key for the authenticated user.
+    
+    Request body (JSON):
+    - name: Optional name for the API key. Default is 'Default API Key'.
+    
+    Authentication:
+    - Requires a valid Auth0 Bearer token in the Authorization header
+    
+    Restrictions:
+    - Users are limited to one API key per account
+    
+    Returns:
+    - 201 Created: Successfully created API key
+      {
+        "api_key": "uuid-string",
+        "name": "string"
+      }
+    
+    Errors:
+    - 400 Bad Request: Invalid request format
+    - 401 Unauthorized: Missing or invalid authentication
+    - 403 Forbidden: API key limit reached
+      {
+        "error": "API key limit reached",
+        "message": "You can only have one API key per account"
+      }
+    - 404 Not Found: User not found
+    - 500 Internal Server Error: Server-side error
+    """
     try:
         # Get and validate auth header
         auth_header = request.headers.get('Authorization')
@@ -52,6 +82,19 @@ def create_api_key():
                 
                 user_id = result[0]
                 
+                # Check if user already has an API key
+                cur.execute(
+                    "SELECT COUNT(*) FROM api_keys WHERE user_id = %s",
+                    (user_id,)
+                )
+                key_count = cur.fetchone()[0]
+                
+                if key_count > 0:
+                    return jsonify({
+                        'error': 'API key limit reached',
+                        'message': 'You can only have one API key per account'
+                    }), 403
+                
                 # Generate a new API key
                 api_key = str(uuid.uuid4())
                 
@@ -84,6 +127,30 @@ def create_api_key():
 
 @api_customer_bp.route('/list_api_keys', methods=['GET'])
 def list_api_keys():
+    """
+    List all API keys belonging to the authenticated user.
+    
+    Authentication:
+    - Requires a valid Auth0 Bearer token in the Authorization header
+    
+    Returns:
+    - 200 OK: List of API keys
+      {
+        "api_keys": [
+          {
+            "id": "string",
+            "api_key": "uuid-string",
+            "name": "string",
+            "created_at": "ISO-8601 datetime string"
+          }
+        ]
+      }
+    
+    Errors:
+    - 401 Unauthorized: Missing or invalid authentication
+    - 404 Not Found: User not found
+    - 500 Internal Server Error: Server-side error
+    """
     try:
         # Get and validate auth header
         auth_header = request.headers.get('Authorization')
@@ -171,9 +238,39 @@ def get_api_usage():
     - The API key must belong to the authenticated user
     
     Returns:
-    - Usage data aggregated by the specified period
-    - List of individual API calls (limited to 100)
-    - Credit limit and usage information
+    - 200 OK: API usage data
+      {
+        "api_key": "uuid-string",
+        "period": "day|week|month",
+        "usage_data": [
+          {
+            "period_start": "ISO-8601 datetime string",
+            "credits_used": float
+          }
+        ],
+        "api_calls": [
+          {
+            "endpoint": "string",
+            "status_code": integer,
+            "latency_ms": integer,
+            "timestamp": "ISO-8601 datetime string",
+            "credits_used": float
+          }
+        ],
+        "credit_limit": integer,
+        "current_month_usage": float,
+        "remaining_credits": float
+      }
+    
+    Errors:
+    - 400 Bad Request: Missing or invalid parameters
+      {
+        "error": "Missing parameter|Invalid parameter",
+        "message": "Detailed error message"
+      }
+    - 401 Unauthorized: Missing or invalid authentication
+    - 404 Not Found: API key not found
+    - 500 Internal Server Error: Server-side error
     """
     try:
         # Validate required parameters
@@ -298,9 +395,9 @@ def get_api_usage():
                 # Get individual API calls
                 call_query = """
                 SELECT 
-                    endpoint,
+                    endpoint_name,
                     status_code,
-                    latency_ms,
+                    response_time_ms,
                     created_at,
                     credits_used
                 FROM 
