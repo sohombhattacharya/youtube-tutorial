@@ -128,3 +128,26 @@ CREATE TABLE note_generation_history (
     generated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(user_id, youtube_video_id, note_type)
 );
+
+-- Table for storing API keys
+CREATE TABLE api_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    api_key UUID NOT NULL UNIQUE,
+    name TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- Table for logging API calls
+CREATE TABLE api_calls (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    api_key UUID NOT NULL,
+    endpoint_name TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    credits_used INTEGER NOT NULL,
+    request_ip VARCHAR(45),
+    request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    response_time_ms INTEGER,
+    CONSTRAINT fk_api_key FOREIGN KEY (api_key) REFERENCES api_keys(api_key) ON DELETE CASCADE
+);

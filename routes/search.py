@@ -692,18 +692,47 @@ def process_video(video):
         return None
 
 @search_bp.route('/deep_search', methods=['GET'])
-def search_youtube_endpoint_v2_test():
-
-    BETA_API_KEY = os.getenv('BETA_API_KEY')
-
-    # bearer token 
-    auth_header = request.headers.get('Authorization')
-    if auth_header and auth_header.startswith('Bearer '):
-        token = auth_header.split(' ')[1]
-        if token != BETA_API_KEY:
-            return jsonify({'error': 'Invalid API key'}), 401
-
+def search_youtube_endpoint_v2():
+    start_time = time.time()
+    api_key = None
     try:
+        # Get API key from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'API key required'}), 401
+        
+        api_key = auth_header.split(' ')[1]
+        
+        # Check if this is the beta API key
+        BETA_API_KEY = os.getenv('BETA_API_KEY')
+        is_beta_key = (api_key == BETA_API_KEY)
+        
+        if not is_beta_key:
+            # Validate API key against database
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT api_keys.id, api_keys.user_id, users.subscription_status
+                    FROM api_keys
+                    JOIN users ON api_keys.user_id = users.id
+                    WHERE api_keys.api_key = %s
+                    """,
+                    (api_key,)
+                )
+                result = cur.fetchone()
+                
+                if not result:
+                    return jsonify({'error': 'Invalid API key'}), 401
+                
+                api_key_id = result[0]
+                user_id = result[1]
+                subscription_status = result[2]
+                
+                # Check if user has an active subscription
+                if subscription_status != 'ACTIVE':
+                    return jsonify({'error': 'Active subscription required'}), 403
+
         search_query = request.args.get('search', '').strip()
         if not search_query:
             return jsonify({'error': 'No search query provided'}), 400
@@ -868,6 +897,25 @@ def search_youtube_endpoint_v2_test():
                     
                     sources.append(source)
 
+                # Calculate total response time
+                response_time_ms = int((time.time() - start_time) * 1000)
+                
+                # Log API call to database if not using beta key
+                if not is_beta_key:
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO api_calls 
+                                (api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
+                                VALUES (%s, %s, %s, %s, %s, %s)
+                                """,
+                                (api_key, '/deep_search', 200, 1, request.remote_addr, response_time_ms)
+                            )
+                            conn.commit()
+                    except Exception as e:
+                        logging.error(f"Error logging API call: {str(e)}")
+                
                 # Return both markdown content and sources list
                 if markdown_content:
                     logging.info(timing_info)
@@ -884,12 +932,51 @@ def search_youtube_endpoint_v2_test():
                         'sources': sources
                     }), 200
                 else:
+                    # Log failed API call if not using beta key
+                    if not is_beta_key and 'conn' in locals():
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO api_calls 
+                                    (api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                    """,
+                                    (api_key, '/deep_search', 500, 0, request.remote_addr, response_time_ms)
+                                )
+                                conn.commit()
+                        except Exception as e:
+                            logging.error(f"Error logging API call: {str(e)}")
+                        
                     return jsonify({'error': 'Failed to generate report'}), 500
             
     except Exception as e:
+        # Calculate response time even for errors
+        response_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Log error API call if we have the API key and it's not the beta key
+        if not is_beta_key:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO api_calls 
+                        (api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (api_key, '/deep_search', 500, 0, request.remote_addr, response_time_ms)
+                    )
+                    conn.commit()
+            except Exception as log_error:
+                logging.error(f"Error logging API call: {str(log_error)}")
+            
         logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500    
-    
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        # Close database connection if it exists
+        if 'conn' in locals():
+            conn.close()
+
 def fast_search_youtube(search_query):
         logging.info(f"Starting fast search for {search_query}")
         timing_info = {}
