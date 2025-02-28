@@ -147,7 +147,6 @@ CREATE TABLE api_calls (
     status_code INTEGER NOT NULL,
     credits_used INTEGER NOT NULL,
     request_ip TEXT,
-    response_s3_path TEXT,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     response_time_ms INTEGER,
     CONSTRAINT fk_api_key FOREIGN KEY (api_key) REFERENCES api_keys(api_key) ON DELETE CASCADE
@@ -156,4 +155,4 @@ CREATE TABLE api_calls (
 ALTER TABLE users ADD COLUMN product_id TEXT;
 update users set product_id = 'prod_ReHCbnoM7AN0UF' where subscription_status = 'ACTIVE';
 
-ALTER TABLE api_calls ADD COLUMN IF NOT EXISTS response_s3_path TEXT;
+ALTER TABLE api_calls DROP COLUMN response_s3_path;

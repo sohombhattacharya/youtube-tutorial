@@ -385,6 +385,7 @@ def get_api_usage():
                 # Get individual API calls for the month
                 call_query = """
                 SELECT 
+                    id,
                     endpoint_name,
                     status_code,
                     response_time_ms,
@@ -407,11 +408,12 @@ def get_api_usage():
                 api_calls = []
                 for row in cur.fetchall():
                     api_calls.append({
-                        'endpoint': row[0],
-                        'status_code': row[1],
-                        'latency_ms': row[2],
-                        'timestamp': row[3].isoformat(),
-                        'credits_used': float(row[4]) if row[4] else 0
+                        'id': row[0],
+                        'endpoint': row[1],
+                        'status_code': row[2],
+                        'latency_ms': row[3],
+                        'timestamp': row[4].isoformat(),
+                        'credits_used': float(row[5]) if row[5] else 0
                     })
                 
                 # Get subscription information
@@ -478,4 +480,140 @@ def get_api_usage():
             
     except Exception as e:
         logging.error(f"Error in get_api_usage: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@api_customer_bp.route('/get_api_call_response', methods=['GET'])
+def get_api_call_response():
+    """
+    Retrieve the stored response for a specific API call.
+    
+    Required parameters:
+    - api_call_id: The ID of the API call to retrieve the response for
+    - api_key: The API key used for the original request
+    
+    Authentication:
+    - Requires a valid Auth0 Bearer token in the Authorization header
+    - The API key must belong to the authenticated user
+    
+    Returns:
+    - 200 OK: The stored API call response
+    
+    Errors:
+    - 400 Bad Request: Missing or invalid parameters
+    - 401 Unauthorized: Missing or invalid authentication
+    - 403 Forbidden: API key doesn't belong to the authenticated user
+    - 404 Not Found: API call not found or response not available
+    - 500 Internal Server Error: Server-side error
+    """
+    try:
+        # Validate required parameters
+        api_call_id = request.args.get('api_call_id')
+        api_key = request.args.get('api_key')
+        
+        if not api_call_id:
+            return jsonify({
+                'error': 'Missing parameter',
+                'message': 'The api_call_id parameter is required'
+            }), 400
+            
+        if not api_key:
+            return jsonify({
+                'error': 'Missing parameter',
+                'message': 'The api_key parameter is required'
+            }), 400
+        
+        # Get and validate auth header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
+
+        # Process authentication token
+        token = auth_header.split(' ')[1]
+        try:
+            decoded_token = jwt.decode(
+                token,
+                auth0_validator.public_key,
+                claims_options={
+                    "aud": {"essential": True, "value": os.getenv('AUTH0_AUDIENCE')},
+                    "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+                }
+            )
+            auth0_id = decoded_token['sub']
+        except Exception as e:
+            logging.error(f"Error verifying token: {str(e)}")
+            return jsonify({'error': 'Authentication error'}), 401
+            
+        # Connect to database
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                # Verify the API key belongs to the authenticated user
+                cur.execute(
+                    """
+                    SELECT api_keys.id 
+                    FROM api_keys 
+                    JOIN users ON api_keys.user_id = users.id 
+                    WHERE api_keys.api_key = %s AND users.auth0_id = %s
+                    """,
+                    (api_key, auth0_id)
+                )
+                
+                if not cur.fetchone():
+                    return jsonify({'error': 'API key not found or does not belong to you'}), 403
+                
+                # Verify the API call exists and belongs to this API key
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM api_calls
+                    WHERE id = %s AND api_key = %s
+                    """,
+                    (api_call_id, api_key)
+                )
+                
+                if not cur.fetchone():
+                    return jsonify({'error': 'API call not found or does not belong to this API key'}), 404
+                
+                try:
+                    # Import boto3 here to avoid loading it unnecessarily for other endpoints
+                    import boto3
+                    
+                    # Get the response from S3
+                    s3_client = boto3.client(
+                        's3',
+                        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                    )
+                    bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                    
+                    # Use the same S3 key format as in search.py
+                    s3_key = f"api_responses/{api_call_id}.json"
+                    
+                    try:
+                        response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                        response_body = response['Body'].read().decode('utf-8')
+                    except s3_client.exceptions.NoSuchKey:
+                        return jsonify({'error': 'Response data not found in storage'}), 404
+                    
+                    # Try to parse as JSON, but return as string if not valid JSON
+                    try:
+                        import json
+                        response_data = json.loads(response_body)
+                        return jsonify(response_data), 200
+                    except json.JSONDecodeError:
+                        # If not valid JSON, return as plain text
+                        return response_body, 200, {'Content-Type': 'text/plain'}
+                    
+                except Exception as e:
+                    logging.error(f"Error retrieving response from S3: {str(e)}")
+                    return jsonify({'error': 'Failed to retrieve response data from storage'}), 500
+                
+        except Exception as e:
+            logging.error(f"Database error in get_api_call_response: {str(e)}")
+            return jsonify({'error': 'Failed to retrieve API call data'}), 500
+        finally:
+            conn.close()
+            
+    except Exception as e:
+        logging.error(f"Error in get_api_call_response: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
