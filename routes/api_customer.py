@@ -346,7 +346,7 @@ def get_api_usage():
                 # Get daily usage for the specified month
                 query = """
                 SELECT 
-                    DATE(created_at AT TIME ZONE 'UTC') AS usage_date,
+                    DATE(created_at) AS usage_date,
                     SUM(credits_used) AS total_credits
                 FROM 
                     api_calls
@@ -355,7 +355,7 @@ def get_api_usage():
                     AND created_at >= %s
                     AND created_at < %s
                 GROUP BY 
-                    DATE(created_at AT TIME ZONE 'UTC')
+                    DATE(created_at)
                 ORDER BY 
                     usage_date
                 """
@@ -374,8 +374,11 @@ def get_api_usage():
                 daily_usage = []
                 for day in range(1, num_days + 1):
                     date_str = f"{month_date.year}-{month_date.month:02d}-{day:02d}"
+                    # Create a UTC datetime object for midnight on this day
+                    day_datetime = datetime(month_date.year, month_date.month, day, 
+                                           tzinfo=timezone.utc)
                     daily_usage.append({
-                        'date': date_str,
+                        'date': day_datetime.isoformat(),
                         'credits_used': usage_by_date.get(date_str, 0)
                     })
                 
@@ -385,7 +388,7 @@ def get_api_usage():
                     endpoint_name,
                     status_code,
                     response_time_ms,
-                    created_at AT TIME ZONE 'UTC' as created_at_utc,
+                    created_at,
                     credits_used
                 FROM 
                     api_calls
