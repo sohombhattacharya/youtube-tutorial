@@ -992,9 +992,14 @@ def deep_research():
                         
                         # Prepare the exact JSON that's being returned to the client
                         response_data = {
-                            'title': title,
-                            'content': markdown_content,
-                            'sources': sources
+                            "request": {
+                                "search": search_query,
+                            },
+                            "response": {
+                                'title': title,
+                                'content': markdown_content,
+                                'sources': sources
+                            }
                         }
                         
                         # Store the response JSON in S3
