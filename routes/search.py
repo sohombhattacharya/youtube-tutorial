@@ -4,6 +4,7 @@ import re
 import os
 import boto3
 import tempfile
+import uuid  # Add this import
 from xhtml2pdf import pisa
 import fitz  # PyMuPDF
 import io
@@ -691,10 +692,46 @@ def process_video(video):
         logging.error(f"Error processing video {video_url}: {str(e)}")
         return None
 
-@search_bp.route('/deep_search', methods=['GET'])
-def deep_search():
+@search_bp.route('/deep_research', methods=['GET'])
+def deep_research():
+    """
+    Generate a comprehensive research report based on YouTube content.
+    
+    Required parameters:
+    - search: The search query or research topic
+    
+    Authentication:
+    - Requires a valid API key as Bearer token in the Authorization header
+    
+    Returns:
+    - 200 OK: Successfully generated report
+      {
+        "title": "string",
+        "content": "markdown string",
+        "sources": [
+          {
+            "number": integer,
+            "title": "string",
+            "url": "string"
+          }
+        ]
+      }
+    
+    Errors:
+    - 400 Bad Request: Missing or invalid search query
+    - 401 Unauthorized: Missing or invalid API key
+    - 403 Forbidden: Credit limit reached
+      {
+        "error": "Credit limit reached",
+        "message": "This call would exceed your monthly limit of X credits"
+      }
+    - 500 Internal Server Error: Server-side error
+    """
     start_time = time.time()
     api_key = None
+    conn = None
+    api_call_id = str(uuid.uuid4())  # Generate UUID for both DB and S3
+    
     try:
         # Get API key from Authorization header
         auth_header = request.headers.get('Authorization')
@@ -931,21 +968,575 @@ def deep_search():
                 # Calculate total response time
                 response_time_ms = int((time.time() - start_time) * 1000)
                 
-                # Log API call to database if not using beta key
-                if not is_beta_key:
+                # Return both markdown content and sources list
+                if markdown_content:
+                    logging.info(timing_info)
+
+                    title = ''
+                    for line in markdown_content.split('\n'):
+                        if line.startswith('# '):
+                            title = line.replace('# ', '').strip()
+                            break
+
+                    # Store response in S3 for auditing - SIMPLIFIED
                     try:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                INSERT INTO api_calls 
-                                (api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
-                                VALUES (%s, %s, %s, %s, %s, %s)
-                                """,
-                                (api_key, '/deep_search', 200, 1, request.remote_addr, response_time_ms)
-                            )
-                            conn.commit()
+                        s3_client = boto3.client(
+                            's3',
+                            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                        )
+                        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                        
+                        # Use the UUID as the S3 key
+                        s3_key = f"api_responses/{api_call_id}.json"
+                        
+                        # Prepare response data
+                        response_data = {
+                            'title': title,
+                            'content': markdown_content,
+                            'sources': sources,
+                            'query': search_query,
+                            'timestamp': int(time.time()),
+                            'api_key': api_key,
+                            'timing_info': timing_info
+                        }
+                        
+                        # Store in S3
+                        s3_client.put_object(
+                            Bucket=bucket_name,
+                            Key=s3_key,
+                            Body=json.dumps(response_data),
+                            ContentType='application/json'
+                        )
+                        
                     except Exception as e:
-                        logging.error(f"Error logging API call: {str(e)}")
+                        logging.error(f"Error storing API response in S3: {str(e)}")
+                        # Continue even if S3 storage fails
+                    
+                    # Log API call to database if not using beta key - using the UUID as id
+                    if not is_beta_key and conn:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO api_calls 
+                                    (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    """,
+                                    (api_call_id, api_key, '/deep_research', 200, credits_for_this_call, request.remote_addr, response_time_ms)
+                                )
+                                conn.commit()
+                        except Exception as e:
+                            logging.error(f"Error logging API call: {str(e)}")
+
+                    return jsonify({
+                        'title': title,
+                        'content': markdown_content,
+                        'sources': sources
+                    }), 200
+                else:
+                    # Log failed API call if not using beta key
+                    if not is_beta_key and conn:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO api_calls 
+                                    (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    """,
+                                    (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms)
+                                )
+                                conn.commit()
+                        except Exception as e:
+                            logging.error(f"Error logging API call: {str(e)}")
+                        
+                    return jsonify({'error': 'Failed to generate report'}), 500
+            
+    except Exception as e:
+        # Calculate response time even for errors
+        response_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Log error API call if we have the API key and it's not the beta key
+        if api_key and not is_beta_key and conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO api_calls 
+                        (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms)
+                    )
+                    conn.commit()
+            except Exception as log_error:
+                logging.error(f"Error logging API call: {str(log_error)}")
+            
+        logging.error(f"Error in search_youtube: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        # Close database connection if it exists
+        if conn:
+            conn.close()
+
+def fast_search_youtube(search_query):
+        logging.info(f"Starting fast search for {search_query}")
+        timing_info = {}
+        timing_info['query'] = search_query
+        
+        # Time the YouTube scraping
+        videos, scrape_time = scrape_youtube_links(search_query)
+        logging.info(f"Scraping time: {scrape_time:.2f} seconds")
+        timing_info['youtube_scraping'] = f"{scrape_time:.2f} seconds"
+        
+        # Process all videos in parallel with timeout and connection limiting
+        all_tutorials = []
+        processing_start = time.time()
+        
+        # Create a semaphore to limit concurrent connections
+        max_concurrent = 25  # Adjust based on your server's capacity
+        semaphore = BoundedSemaphore(max_concurrent)
+        
+        def process_with_semaphore(video):
+            with semaphore:
+                return process_video(video)
+        
+        # Process all videos in parallel with timeout
+        with ThreadPoolExecutor(max_workers=len(videos)) as executor:
+            future_to_video = {
+                executor.submit(process_with_semaphore, video): video 
+                for video in videos
+            }
+            
+            # Collect results with timeout
+            for future in as_completed(future_to_video, timeout=90):
+                try:
+                    result = future.result(timeout=90)  
+                    if result:
+                        all_tutorials.append(result)
+                except TimeoutError:
+                    video = future_to_video[future]
+                    logging.warning(f"Timeout processing video: {video[0]}")
+                    continue
+                except Exception as e:
+                    video = future_to_video[future]
+                    logging.error(f"Error processing video {video[0]}: {str(e)}")
+                    continue
+        
+        processing_time = time.time() - processing_start
+        timing_info['video_processing'] = f"{processing_time:.2f} seconds"
+
+        # Generate comprehensive report using selected LLM
+        if all_tutorials:
+            llm_start = time.time()
+            prompt = (
+                "# Analysis Task\n\n"
+                f"## User Query\n{search_query}\n\n"
+                "## Task Overview\n"
+                "1. First, analyze the user's query to understand:\n"
+                "   - Is this a specific question seeking direct answers?\n"
+                "   - Is this a broad topic requiring synthesis and exploration?\n"
+                "   - What are the key aspects or dimensions that need to be addressed?\n"
+                "   - What would be most valuable to the user based on their query?\n"
+                "   - What deeper implications or connections should be explored?\n\n"
+                "2. Then, without mentioning the type of the user's query, and without mentioning that this is an analysis of video transcripts, structure your response appropriately based on the query type. For example:\n"
+                "   - For specific questions: Provide comprehensive answers with in-depth analysis and multiple perspectives\n"
+                "   - For broad topics: Deliver thorough synthesis with detailed exploration of key themes\n"
+                "   - For comparisons: Examine nuanced differences and complex trade-offs\n"
+                "   - For how-to queries: Include detailed methodology and consideration of edge cases\n\n"
+                "## Content Guidelines\n"
+                " - Create a title for the report that is a summary of the report\n"
+                "- Structure the response in the most logical way for this specific query\n"
+                "- Deeply analyze different perspectives and approaches\n"
+                "- Highlight both obvious and subtle connections between sources\n"
+                "- Examine any contradictions or disagreements in detail\n"
+                "- Draw meaningful conclusions that directly relate to the query\n"
+                "- Consider practical implications and real-world applications\n"
+                "- Explore edge cases and potential limitations\n"
+                "- Identify patterns and trends across sources\n\n"
+                "## Citation and Reference Guidelines\n"
+                "- Include timestamp links whenever referencing specific content\n"
+                "- Add timestamps for:\n"
+                "  * Direct quotes or key statements\n"
+                "  * Important examples or demonstrations\n"
+                "  * Technical explanations or tutorials\n"
+                "  * Expert opinions or insights\n"
+                "  * Supporting evidence for major claims\n"
+                "  * Contrasting viewpoints or approaches\n"
+                "- Format timestamps as markdown links to specific moments in the videos\n"
+                "- Integrate timestamps naturally into the text to maintain readability\n"
+                "- Use multiple timestamps when a point is supported across different sources\n\n"
+                "## Formatting Requirements\n"
+                "- Use proper markdown headers (# for main title, ## for sections)\n"
+                "- Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "- Format quotes with > for blockquotes\n"
+                "- Use **bold** for emphasis\n"
+                "- Ensure all newlines are proper markdown line breaks\n"
+                "- Format timestamps as [MM:SS](video-link) or similar\n\n"
+                "## Source Materials\n"
+                f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
+                "Analyze these materials thoroughly to provide a detailed, well-reasoned response that best serves the user's needs. "
+                "Don't summarize - dig deep into the content and explore all relevant aspects and implications. "
+                "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
+            )
+            
+            model = genai.GenerativeModel("gemini-2.0-flash-lite")
+            response = model.generate_content(prompt)
+            response_text = response.text if response else None
+            
+            llm_time = time.time() - llm_start
+            timing_info['llm_generation'] = f"{llm_time:.2f} seconds"
+            
+            if response_text:
+                
+                # Create a mapping of video IDs to source numbers
+                video_id_to_source = {}
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        video_id_to_source[video_id] = i
+
+                # Update timestamp hyperlinks with source numbers
+                def add_source_number(match):
+                    url = match.group(0)
+                    
+                    # Only process links that are actual YouTube timestamp links
+                    if not ('youtu.be' in url and '?t=' in url):
+                        return url
+                        
+                    video_id_match = re.search(r'youtu\.be/([0-9A-Za-z_-]{11})', url)
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        source_num = video_id_to_source.get(video_id)
+                        if source_num:
+                            # Extract the display text (time) from the markdown link
+                            display_text_match = re.search(r'\[(.*?)\]', url)
+                            if not display_text_match:
+                                return url
+                            display_text = display_text_match.group(1)
+                            
+                            # Extract the URL part from the markdown link
+                            url_match = re.search(r'\((.*?)\)', url)
+                            if not url_match:
+                                return url
+                            url_part = url_match.group(1)
+                            
+                            # Verify this is a valid timestamp link before formatting
+                            if display_text and url_part and 'youtu.be' in url_part and '?t=' in url_part:
+                                return f'[({source_num}) {display_text}]({url_part})'
+                        return url
+                    return url
+
+                # Update the regex pattern to only match YouTube timestamp links
+                markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
+
+                # Create sources list instead of appending to markdown
+                sources = []
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    source = {
+                        'number': i,
+                        'title': tutorial['title'],
+                        'url': f'https://youtube.com/watch?v={video_id_match.group(1)}' if video_id_match else tutorial['url']
+                    }
+                    
+                    sources.append(source)
+
+                # Return both markdown content and sources list
+                if markdown_content:
+                    logging.info(timing_info)
+
+                    title = ''
+                    for line in markdown_content.split('\n'):
+                        if line.startswith('# '):
+                            title = line.replace('# ', '').strip()
+                            break
+
+                    return {
+                        'title': title,
+                        'content': markdown_content,
+                        'sources': sources
+                    }
+                else:
+                    return {'error': 'Failed to generate report'}
+
+@search_bp.route('/deep_search', methods=['GET'])
+def deep_search():
+    """
+    Generate a comprehensive research report based on YouTube content.
+    
+    Required parameters:
+    - search: The search query or research topic
+    
+    Authentication:
+    - Requires a valid API key as Bearer token in the Authorization header
+    
+    Returns:
+    - 200 OK: Successfully generated report
+      {
+        "title": "string",
+        "content": "markdown string",
+        "sources": [
+          {
+            "number": integer,
+            "title": "string",
+            "url": "string"
+          }
+        ]
+      }
+    
+    Errors:
+    - 400 Bad Request: Missing or invalid search query
+    - 401 Unauthorized: Missing or invalid API key
+    - 403 Forbidden: Credit limit reached
+      {
+        "error": "Credit limit reached",
+        "message": "This call would exceed your monthly limit of X credits"
+      }
+    - 500 Internal Server Error: Server-side error
+    """
+    start_time = time.time()
+    api_key = None
+    conn = None
+    s3_response_path = None
+    
+    try:
+        # Get API key from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'API key required'}), 401
+        
+        api_key = auth_header.split(' ')[1]
+        
+        # Check if this is the beta API key
+        BETA_API_KEY = os.getenv('BETA_API_KEY')
+        is_beta_key = (api_key == BETA_API_KEY)
+        
+        if not is_beta_key:
+            # Validate API key against database
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT api_keys.id, api_keys.user_id, users.subscription_status, users.product_id
+                    FROM api_keys
+                    JOIN users ON api_keys.user_id = users.id
+                    WHERE api_keys.api_key = %s
+                    """,
+                    (api_key,)
+                )
+                result = cur.fetchone()
+                
+                if not result:
+                    return jsonify({'error': 'Invalid API key'}), 401
+                
+                subscription_status = result[2]
+                subscription_product_id = result[3]
+                
+                # Check credit limits based on subscription status
+                # Get current month's credit usage
+                cur.execute(
+                    """
+                    SELECT SUM(credits_used) 
+                    FROM api_calls 
+                    WHERE api_key = %s 
+                    AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+                    """,
+                    (api_key,)
+                )
+                current_usage = cur.fetchone()[0] or 0
+                
+                # Credits for this call
+                credits_for_this_call = 100
+                
+                # Define credit limits based on subscription
+                PRO_PLAN_PRODUCT_ID = os.getenv('PRO_PLAN_PRODUCT_ID')
+                
+                if subscription_status != 'ACTIVE':
+                    # Free user - 500 credits/month
+                    if current_usage + credits_for_this_call > 500:
+                        return jsonify({
+                            'error': 'Credit limit reached',
+                            'message': 'This call would exceed your monthly limit of 500 credits. Please upgrade for higher volume needs.'
+                        }), 403
+                elif subscription_product_id == PRO_PLAN_PRODUCT_ID:
+                    # Pro user - 1500 credits/month
+                    if current_usage + credits_for_this_call > 1500:
+                        return jsonify({
+                            'error': 'Credit limit reached',
+                            'message': 'This call would exceed your monthly limit of 1500 credits. Please upgrade for higher volume needs.'
+                        }), 403
+                # If user has an active subscription but not Pro, they were already checked above
+                # for the basic subscription status check
+
+        search_query = request.args.get('search', '').strip()
+        if not search_query:
+            return jsonify({'error': 'No search query provided'}), 400
+        
+        timing_info = {}
+        timing_info['query'] = search_query
+        
+        # Time the YouTube scraping
+        videos, scrape_time = scrape_youtube_links(search_query)
+        timing_info['youtube_scraping'] = f"{scrape_time:.2f} seconds"
+        
+        # Process all videos in parallel with timeout and connection limiting
+        all_tutorials = []
+        processing_start = time.time()
+        
+        # Create a semaphore to limit concurrent connections
+        max_concurrent = 25  # Adjust based on your server's capacity
+        semaphore = BoundedSemaphore(max_concurrent)
+        
+        def process_with_semaphore(video):
+            with semaphore:
+                return process_video(video)
+        
+        # Process all videos in parallel with timeout
+        with ThreadPoolExecutor(max_workers=len(videos)) as executor:
+            future_to_video = {
+                executor.submit(process_with_semaphore, video): video 
+                for video in videos
+            }
+            
+            # Collect results with timeout
+            for future in as_completed(future_to_video, timeout=90):
+                try:
+                    result = future.result(timeout=90)  
+                    if result:
+                        all_tutorials.append(result)
+                except TimeoutError:
+                    video = future_to_video[future]
+                    logging.warning(f"Timeout processing video: {video[0]}")
+                    continue
+                except Exception as e:
+                    video = future_to_video[future]
+                    logging.error(f"Error processing video {video[0]}: {str(e)}")
+                    continue
+        
+        processing_time = time.time() - processing_start
+        timing_info['video_processing'] = f"{processing_time:.2f} seconds"
+
+        # Generate comprehensive report using selected LLM
+        if all_tutorials:
+            llm_start = time.time()
+            prompt = (
+                "# Analysis Task\n\n"
+                f"## User Query\n{search_query}\n\n"
+                "## Task Overview\n"
+                "1. First, analyze the user's query to understand:\n"
+                "   - Is this a specific question seeking direct answers?\n"
+                "   - Is this a broad topic requiring synthesis and exploration?\n"
+                "   - What are the key aspects or dimensions that need to be addressed?\n"
+                "   - What would be most valuable to the user based on their query?\n"
+                "   - What deeper implications or connections should be explored?\n\n"
+                "2. Then, without mentioning the type of the user's query, and without mentioning that this is an analysis of video transcripts, structure your response appropriately based on the query type. For example:\n"
+                "   - For specific questions: Provide comprehensive answers with in-depth analysis and multiple perspectives\n"
+                "   - For broad topics: Deliver thorough synthesis with detailed exploration of key themes\n"
+                "   - For comparisons: Examine nuanced differences and complex trade-offs\n"
+                "   - For how-to queries: Include detailed methodology and consideration of edge cases\n\n"
+                "## Content Guidelines\n"
+                " - Create a title for the report that is a summary of the report\n"
+                "- Structure the response in the most logical way for this specific query\n"
+                "- Deeply analyze different perspectives and approaches\n"
+                "- Highlight both obvious and subtle connections between sources\n"
+                "- Examine any contradictions or disagreements in detail\n"
+                "- Draw meaningful conclusions that directly relate to the query\n"
+                "- Consider practical implications and real-world applications\n"
+                "- Explore edge cases and potential limitations\n"
+                "- Identify patterns and trends across sources\n\n"
+                "## Citation and Reference Guidelines\n"
+                "- Include timestamp links whenever referencing specific content\n"
+                "- Add timestamps for:\n"
+                "  * Direct quotes or key statements\n"
+                "  * Important examples or demonstrations\n"
+                "  * Technical explanations or tutorials\n"
+                "  * Expert opinions or insights\n"
+                "  * Supporting evidence for major claims\n"
+                "  * Contrasting viewpoints or approaches\n"
+                "- Format timestamps as markdown links to specific moments in the videos\n"
+                "- Integrate timestamps naturally into the text to maintain readability\n"
+                "- Use multiple timestamps when a point is supported across different sources\n\n"
+                "## Formatting Requirements\n"
+                "- Use proper markdown headers (# for main title, ## for sections)\n"
+                "- Use proper markdown lists (- for bullets, 1. for numbered lists)\n"
+                "- Format quotes with > for blockquotes\n"
+                "- Use **bold** for emphasis\n"
+                "- Ensure all newlines are proper markdown line breaks\n"
+                "- Format timestamps as [MM:SS](video-link) or similar\n\n"
+                "## Source Materials\n"
+                f"{json.dumps([{'title': t['title'], 'content': t['content']} for t in all_tutorials], indent=2)}\n\n"
+                "Analyze these materials thoroughly to provide a detailed, well-reasoned response that best serves the user's needs. "
+                "Don't summarize - dig deep into the content and explore all relevant aspects and implications. "
+                "Support your analysis with specific references and timestamp links throughout the response. Don't mention that this is an analysis of multiple YouTube video transcripts. "
+            )
+            
+            model = genai.GenerativeModel("gemini-2.0-flash-lite")
+            response = model.generate_content(prompt)
+            response_text = response.text if response else None
+            
+            llm_time = time.time() - llm_start
+            timing_info['llm_generation'] = f"{llm_time:.2f} seconds"
+            
+            if response_text:
+                # Create a mapping of video IDs to source numbers
+                video_id_to_source = {}
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        video_id_to_source[video_id] = i
+
+                # Update timestamp hyperlinks with source numbers
+                def add_source_number(match):
+                    url = match.group(0)
+                    
+                    # Only process links that are actual YouTube timestamp links
+                    if not ('youtu.be' in url and '?t=' in url):
+                        return url
+                        
+                    video_id_match = re.search(r'youtu\.be/([0-9A-Za-z_-]{11})', url)
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        source_num = video_id_to_source.get(video_id)
+                        if source_num:
+                            # Extract the display text (time) from the markdown link
+                            display_text_match = re.search(r'\[(.*?)\]', url)
+                            if not display_text_match:
+                                return url
+                            display_text = display_text_match.group(1)
+                            
+                            # Extract the URL part from the markdown link
+                            url_match = re.search(r'\((.*?)\)', url)
+                            if not url_match:
+                                return url
+                            url_part = url_match.group(1)
+                            
+                            # Verify this is a valid timestamp link before formatting
+                            if display_text and url_part and 'youtu.be' in url_part and '?t=' in url_part:
+                                return f'[({source_num}) {display_text}]({url_part})'
+                        return url
+                    return url
+
+                # Update the regex pattern to only match YouTube timestamp links
+                markdown_content = re.sub(r'\[[^\]]+?\]\(https://youtu\.be/[^)]+\?t=\d+\)', add_source_number, response.text.strip())
+
+                # Create sources list instead of appending to markdown
+                sources = []
+                for i, tutorial in enumerate(all_tutorials, 1):
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', tutorial['url'])
+                    source = {
+                        'number': i,
+                        'title': tutorial['title'],
+                        'url': f'https://youtube.com/watch?v={video_id_match.group(1)}' if video_id_match else tutorial['url']
+                    }
+                    
+                    sources.append(source)
+
+                # Calculate total response time
+                response_time_ms = int((time.time() - start_time) * 1000)
                 
                 # Return both markdown content and sources list
                 if markdown_content:
@@ -989,23 +1580,27 @@ def deep_search():
                             ContentType='application/json'
                         )
                         
-                        # Update the database with the S3 path
-                        if not is_beta_key:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    UPDATE api_calls 
-                                    SET response_s3_path = %s
-                                    WHERE api_key = %s AND created_at = (
-                                        SELECT MAX(created_at) FROM api_calls WHERE api_key = %s
-                                    )
-                                    """,
-                                    (s3_key, api_key, api_key)
-                                )
-                                conn.commit()
+                        s3_response_path = s3_key
+                        
                     except Exception as e:
                         logging.error(f"Error storing API response in S3: {str(e)}")
                         # Continue even if S3 storage fails
+                    
+                    # Log API call to database if not using beta key - do this only once with all information
+                    if not is_beta_key and conn:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO api_calls 
+                                    (api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms, response_s3_path)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    """,
+                                    (api_key, '/deep_search', 200, credits_for_this_call, request.remote_addr, response_time_ms, s3_response_path)
+                                )
+                                conn.commit()
+                        except Exception as e:
+                            logging.error(f"Error logging API call: {str(e)}")
 
                     return jsonify({
                         'title': title,
@@ -1014,7 +1609,7 @@ def deep_search():
                     }), 200
                 else:
                     # Log failed API call if not using beta key
-                    if not is_beta_key and 'conn' in locals():
+                    if not is_beta_key and conn:
                         try:
                             with conn.cursor() as cur:
                                 cur.execute(
@@ -1036,7 +1631,7 @@ def deep_search():
         response_time_ms = int((time.time() - start_time) * 1000)
         
         # Log error API call if we have the API key and it's not the beta key
-        if not is_beta_key:
+        if api_key and not is_beta_key and conn:
             try:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -1055,7 +1650,7 @@ def deep_search():
         return jsonify({'error': 'Internal server error'}), 500
     finally:
         # Close database connection if it exists
-        if 'conn' in locals():
+        if conn:
             conn.close()
 
 def fast_search_youtube(search_query):

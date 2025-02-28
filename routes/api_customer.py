@@ -5,7 +5,8 @@ import uuid
 from authlib.jose import jwt
 from services.auth_service import auth0_validator, AUTH0_DOMAIN
 from services.database import get_db_connection
-from datetime import datetime
+from datetime import datetime, timezone
+import calendar
 
 api_customer_bp = Blueprint('api_customer', __name__)
 
@@ -223,15 +224,13 @@ def list_api_keys():
 @api_customer_bp.route('/get_api_usage', methods=['GET'])
 def get_api_usage():
     """
-    Get API usage statistics for a specific API key.
+    Get API usage statistics for a specific API key, aggregated by day for a single month.
     
     Required parameters:
     - api_key: The API key to get usage statistics for
     
     Optional parameters:
-    - period: Aggregation period ('day', 'week', or 'month'). Default is 'day'.
-    - start_date: Filter results from this date (format: YYYY-MM-DD)
-    - end_date: Filter results until this date (format: YYYY-MM-DD)
+    - month: Month to get usage for in YYYY-MM format (e.g., '2023-03'). Defaults to current month.
     
     Authentication:
     - Requires a valid Auth0 Bearer token in the Authorization header
@@ -241,10 +240,10 @@ def get_api_usage():
     - 200 OK: API usage data
       {
         "api_key": "uuid-string",
-        "period": "day|week|month",
-        "usage_data": [
+        "month": "YYYY-MM",
+        "daily_usage": [
           {
-            "period_start": "ISO-8601 datetime string",
+            "date": "YYYY-MM-DD",
             "credits_used": float
           }
         ],
@@ -253,7 +252,7 @@ def get_api_usage():
             "endpoint": "string",
             "status_code": integer,
             "latency_ms": integer,
-            "timestamp": "ISO-8601 datetime string",
+            "timestamp": "ISO-8601 datetime string in UTC",
             "credits_used": float
           }
         ],
@@ -264,10 +263,6 @@ def get_api_usage():
     
     Errors:
     - 400 Bad Request: Missing or invalid parameters
-      {
-        "error": "Missing parameter|Invalid parameter",
-        "message": "Detailed error message"
-      }
     - 401 Unauthorized: Missing or invalid authentication
     - 404 Not Found: API key not found
     - 500 Internal Server Error: Server-side error
@@ -281,35 +276,33 @@ def get_api_usage():
                 'message': 'The api_key parameter is required'
             }), 400
             
-        # Validate optional parameters
-        period = request.args.get('period', 'day').lower()
-        if period not in ['day', 'week', 'month']:
-            return jsonify({
-                'error': 'Invalid parameter',
-                'message': 'Period must be one of: day, week, month'
-            }), 400
-            
-        start_date = request.args.get('start_date')
-        if start_date:
+        # Get month parameter (default to current month)
+        month = request.args.get('month')
+        if month:
             try:
-                # Validate date format
-                datetime.strptime(start_date, '%Y-%m-%d')
+                # Validate month format
+                month_date = datetime.strptime(month, '%Y-%m').replace(tzinfo=timezone.utc)
+                start_date = f"{month}-01"
+                next_month = datetime.strptime(month, '%Y-%m')
+                if next_month.month == 12:
+                    end_date = f"{next_month.year + 1}-01-01"
+                else:
+                    end_date = f"{next_month.year}-{next_month.month + 1:02d}-01"
             except ValueError:
                 return jsonify({
                     'error': 'Invalid parameter',
-                    'message': 'start_date must be in YYYY-MM-DD format'
+                    'message': 'month must be in YYYY-MM format'
                 }), 400
-                
-        end_date = request.args.get('end_date')
-        if end_date:
-            try:
-                # Validate date format
-                datetime.strptime(end_date, '%Y-%m-%d')
-            except ValueError:
-                return jsonify({
-                    'error': 'Invalid parameter',
-                    'message': 'end_date must be in YYYY-MM-DD format'
-                }), 400
+        else:
+            # Default to current month in UTC
+            today = datetime.now(timezone.utc)
+            month_date = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
+            start_date = f"{today.year}-{today.month:02d}-01"
+            if today.month == 12:
+                end_date = f"{today.year + 1}-01-01"
+            else:
+                end_date = f"{today.year}-{today.month + 1:02d}-01"
+            month = f"{today.year}-{today.month:02d}"
         
         # Get and validate auth header
         auth_header = request.headers.get('Authorization')
@@ -350,80 +343,62 @@ def get_api_usage():
                 if not cur.fetchone():
                     return jsonify({'error': 'API key not found'}), 404
                 
-                # Build the SQL query based on the period
-                date_trunc_expr = f"DATE_TRUNC('{period}', created_at)"
-                
-                query = f"""
+                # Get daily usage for the specified month
+                query = """
                 SELECT 
-                    {date_trunc_expr} AS period_start,
+                    DATE(created_at AT TIME ZONE 'UTC') AS usage_date,
                     SUM(credits_used) AS total_credits
                 FROM 
                     api_calls
                 WHERE 
                     api_key = %s
-                """
-                
-                params = [api_key]
-                
-                # Add date range filters if provided
-                if start_date:
-                    query += " AND created_at >= %s"
-                    params.append(start_date)
-                
-                if end_date:
-                    query += " AND created_at <= %s"
-                    params.append(end_date)
-                
-                # Group by the period and order by date
-                query += f"""
+                    AND created_at >= %s
+                    AND created_at < %s
                 GROUP BY 
-                    {date_trunc_expr}
+                    DATE(created_at AT TIME ZONE 'UTC')
                 ORDER BY 
-                    period_start
+                    usage_date
                 """
                 
-                cur.execute(query, params)
+                cur.execute(query, (api_key, start_date, end_date))
                 
-                # Format the results
-                usage_data = []
+                # Create a dictionary to store usage by date
+                usage_by_date = {}
                 for row in cur.fetchall():
-                    usage_data.append({
-                        'period_start': row[0].isoformat(),
-                        'credits_used': float(row[1]) if row[1] else 0
+                    usage_by_date[row[0].isoformat()] = float(row[1]) if row[1] else 0
+                
+                # Generate all days in the month
+                _, num_days = calendar.monthrange(month_date.year, month_date.month)
+                
+                # Create the daily usage array with all days of the month
+                daily_usage = []
+                for day in range(1, num_days + 1):
+                    date_str = f"{month_date.year}-{month_date.month:02d}-{day:02d}"
+                    daily_usage.append({
+                        'date': date_str,
+                        'credits_used': usage_by_date.get(date_str, 0)
                     })
                 
-                # Get individual API calls
+                # Get individual API calls for the month
                 call_query = """
                 SELECT 
                     endpoint_name,
                     status_code,
                     response_time_ms,
-                    created_at,
+                    created_at AT TIME ZONE 'UTC' as created_at_utc,
                     credits_used
                 FROM 
                     api_calls
                 WHERE 
                     api_key = %s
+                    AND created_at >= %s
+                    AND created_at < %s
+                ORDER BY 
+                    created_at DESC
+                LIMIT 100
                 """
                 
-                call_params = [api_key]
-                
-                # Add date range filters if provided
-                if start_date:
-                    call_query += " AND created_at >= %s"
-                    call_params.append(start_date)
-                
-                if end_date:
-                    call_query += " AND created_at <= %s"
-                    call_params.append(end_date)
-                
-                # Order by date
-                call_query += " ORDER BY created_at DESC"
-                
-                # Add limit to prevent too many results
-                call_query += " LIMIT 100"
-                
-                cur.execute(call_query, call_params)
+                cur.execute(call_query, (api_key, start_date, end_date))
                 
                 # Format the API calls
                 api_calls = []
@@ -474,7 +449,7 @@ def get_api_usage():
                         api_calls
                     WHERE 
                         api_key = %s
-                        AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+                        AND created_at >= DATE_TRUNC('month', CURRENT_DATE AT TIME ZONE 'UTC')
                     """,
                     (api_key,)
                 )
@@ -483,8 +458,8 @@ def get_api_usage():
                 
                 return jsonify({
                     'api_key': api_key,
-                    'period': period,
-                    'usage_data': usage_data,
+                    'month': month,
+                    'daily_usage': daily_usage,
                     'api_calls': api_calls,
                     'credit_limit': credit_limit,
                     'current_month_usage': float(current_month_usage),
@@ -492,6 +467,7 @@ def get_api_usage():
                 }), 200
                 
         except Exception as e:
+            conn.rollback()
             logging.error(f"Database error in get_api_usage: {str(e)}")
             return jsonify({'error': 'Failed to retrieve API usage data'}), 500
         finally:
