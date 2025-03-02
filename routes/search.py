@@ -738,66 +738,61 @@ def deep_research():
         
         api_key = auth_header.split(' ')[1]
         
-        # Check if this is the beta API key
-        BETA_API_KEY = os.getenv('BETA_API_KEY')
-        is_beta_key = (api_key == BETA_API_KEY)
-        
-        if not is_beta_key:
-            # Validate API key against database
-            conn = get_db_connection()
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT api_keys.id, api_keys.user_id, users.subscription_status, users.product_id
-                    FROM api_keys
-                    JOIN users ON api_keys.user_id = users.id
-                    WHERE api_keys.api_key = %s
-                    """,
-                    (api_key,)
-                )
-                result = cur.fetchone()
-                
-                if not result:
-                    return jsonify({'error': 'Invalid API key'}), 401
-                
-                subscription_status = result[2]
-                subscription_product_id = result[3]
-                
-                # Check credit limits based on subscription status
-                # Get current month's credit usage
-                cur.execute(
-                    """
-                    SELECT SUM(credits_used) 
-                    FROM api_calls 
-                    WHERE api_key = %s 
-                    AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
-                    """,
-                    (api_key,)
-                )
-                current_usage = cur.fetchone()[0] or 0
-                
-                # Credits for this call
-                credits_for_this_call = 100
-                
-                # Define credit limits based on subscription
-                PRO_PLAN_PRODUCT_ID = os.getenv('PRO_PLAN_PRODUCT_ID')
-                
-                if subscription_status != 'ACTIVE':
-                    # Free user - 500 credits/month
-                    if current_usage + credits_for_this_call > 500:
-                        return jsonify({
-                            'error': 'Credit limit reached',
-                            'message': 'This call would exceed your monthly limit of 500 credits. Please upgrade for higher volume needs.'
-                        }), 403
-                elif subscription_product_id == PRO_PLAN_PRODUCT_ID:
-                    # Pro user - 1500 credits/month
-                    if current_usage + credits_for_this_call > 1500:
-                        return jsonify({
-                            'error': 'Credit limit reached',
-                            'message': 'This call would exceed your monthly limit of 1500 credits. Please upgrade for higher volume needs.'
-                        }), 403
-                # If user has an active subscription but not Pro, they were already checked above
-                # for the basic subscription status check
+        # Validate API key against database
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT api_keys.id, api_keys.user_id, users.subscription_status, users.product_id
+                FROM api_keys
+                JOIN users ON api_keys.user_id = users.id
+                WHERE api_keys.api_key = %s
+                """,
+                (api_key,)
+            )
+            result = cur.fetchone()
+            
+            if not result:
+                return jsonify({'error': 'Invalid API key'}), 401
+            
+            subscription_status = result[2]
+            subscription_product_id = result[3]
+            
+            # Check credit limits based on subscription status
+            # Get current month's credit usage
+            cur.execute(
+                """
+                SELECT SUM(credits_used) 
+                FROM api_calls 
+                WHERE api_key = %s 
+                AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+                """,
+                (api_key,)
+            )
+            current_usage = cur.fetchone()[0] or 0
+            
+            # Credits for this call
+            credits_for_this_call = 100
+            
+            # Define credit limits based on subscription
+            ADVANCED_PLAN_PRODUCT_ID = os.getenv('ADVANCED_PLAN_PRODUCT_ID')
+            GROWTH_PLAN_PRODUCT_ID = os.getenv('GROWTH_PLAN_PRODUCT_ID')
+            
+            # Set credit limit based on product ID
+            credit_limit = 500  # Default for free users and Pro plan
+            
+            if subscription_status == 'ACTIVE':
+                if subscription_product_id == ADVANCED_PLAN_PRODUCT_ID:
+                    credit_limit = 5000
+                elif subscription_product_id == GROWTH_PLAN_PRODUCT_ID:
+                    credit_limit = 15000
+            
+            # Check if this call would exceed the credit limit
+            if current_usage + credits_for_this_call > credit_limit:
+                return jsonify({
+                    'error': 'Credit limit reached',
+                    'message': f'This call would exceed your monthly limit of {credit_limit} credits. Please upgrade for higher volume needs.'
+                }), 403
 
         search_query = request.args.get('search', '').strip()
         if not search_query:
@@ -1012,21 +1007,20 @@ def deep_research():
                         logging.error(f"Error storing API response in S3: {str(e)}")
                         # Continue even if S3 storage fails
                     
-                    # Log API call to database if not using beta key
-                    if not is_beta_key and conn:
-                        try:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    INSERT INTO api_calls 
-                                    (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                    """,
-                                    (api_call_id, api_key, '/deep_research', 200, credits_for_this_call, request.remote_addr, response_time_ms)
-                                )
-                                conn.commit()
-                        except Exception as e:
-                            logging.error(f"Error logging API call: {str(e)}")
+                    # Log API call to database
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO api_calls 
+                                (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (api_call_id, api_key, '/deep_research', 200, credits_for_this_call, request.remote_addr, response_time_ms)
+                            )
+                            conn.commit()
+                    except Exception as e:
+                        logging.error(f"Error logging API call: {str(e)}")
 
                     return jsonify({
                         'title': title,
@@ -1034,21 +1028,20 @@ def deep_research():
                         'sources': sources
                     }), 200
                 else:
-                    # Log failed API call if not using beta key
-                    if not is_beta_key and conn:
-                        try:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    INSERT INTO api_calls 
-                                    (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                    """,
-                                    (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms)
-                                )
-                                conn.commit()
-                        except Exception as e:
-                            logging.error(f"Error logging API call: {str(e)}")
+                    # Log failed API call
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO api_calls 
+                                (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms)
+                            )
+                            conn.commit()
+                    except Exception as e:
+                        logging.error(f"Error logging API call: {str(e)}")
                         
                     return jsonify({'error': 'Failed to generate report'}), 500
             
@@ -1056,8 +1049,8 @@ def deep_research():
         # Calculate response time even for errors
         response_time_ms = int((time.time() - start_time) * 1000)
         
-        # Log error API call if we have the API key and it's not the beta key
-        if api_key and not is_beta_key and conn:
+        # Log error API call if we have the API key and connection
+        if api_key and conn:
             try:
                 with conn.cursor() as cur:
                     cur.execute(

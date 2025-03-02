@@ -437,13 +437,15 @@ def get_api_usage():
                 subscription_product_id = subscription_info[1] if subscription_info else None
                 
                 # Calculate credit limits
-                credit_limit = 0
-                PRO_PLAN_PRODUCT_ID = os.getenv('PRO_PLAN_PRODUCT_ID')
+                credit_limit = 500  # Default for free users and Pro plan
+                ADVANCED_PLAN_PRODUCT_ID = os.getenv('ADVANCED_PLAN_PRODUCT_ID')
+                GROWTH_PLAN_PRODUCT_ID = os.getenv('GROWTH_PLAN_PRODUCT_ID')
                 
-                if subscription_status != 'ACTIVE':
-                    credit_limit = 500  # Free user
-                elif subscription_product_id == PRO_PLAN_PRODUCT_ID:
-                    credit_limit = 1500  # Pro user
+                if subscription_status == 'ACTIVE':
+                    if subscription_product_id == ADVANCED_PLAN_PRODUCT_ID:
+                        credit_limit = 5000
+                    elif subscription_product_id == GROWTH_PLAN_PRODUCT_ID:
+                        credit_limit = 15000
                 
                 # Get current month's total usage
                 cur.execute(
