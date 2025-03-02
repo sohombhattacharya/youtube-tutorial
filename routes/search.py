@@ -62,7 +62,7 @@ def search_youtube_endpoint():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, subscription_status 
+                    SELECT id, subscription_status, product_id 
                     FROM users 
                     WHERE auth0_id = %s
                     """,
@@ -74,115 +74,113 @@ def search_youtube_endpoint():
                 
                 user_id = result[0]
                 subscription_status = result[1]
+                product_id = result[2]
                 
-                # For non-subscribed users, check report limit
-                if subscription_status != 'ACTIVE':
-                    cur.execute(
-                        """
-                        SELECT COUNT(*) 
-                        FROM user_reports 
-                        WHERE user_id = %s
-                        AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
-                        """,
-                        (user_id,)
-                    )
-                    report_count = cur.fetchone()[0]
+                # Get report limits based on subscription tier
+                report_limit = 3  # Default for free users
+                
+                if subscription_status == 'ACTIVE':
+                    # Get product IDs from environment variables
+                    pro_plan_id = os.getenv('PRO_PLAN_PRODUCT_ID')
+                    advanced_plan_id = os.getenv('ADVANCED_PLAN_PRODUCT_ID')
+                    growth_plan_id = os.getenv('GROWTH_PLAN_PRODUCT_ID')
                     
-                    if report_count >= 2:
-                        return jsonify({
-                            'error': 'Report limit reached',
-                            'message': 'You have reached the maximum number of free reports for this month. Please subscribe for unlimited access.'
-                        }), 403
-                else:
-                    # For subscribed users, check the 10 reports per month limit
-                    cur.execute(
-                        """
-                        SELECT COUNT(*) 
-                        FROM user_reports 
-                        WHERE user_id = %s
-                        AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
-                        """,
-                        (user_id,)
-                    )
-                    report_count = cur.fetchone()[0]
-                    
-                    if report_count >= 10:
-                        return jsonify({
-                            'error': 'Report limit reached',
-                            'message': 'You have reached the maximum number of 10 reports for this month.'
-                        }), 403
+                    if product_id == pro_plan_id:
+                        report_limit = 10
+                    elif product_id == advanced_plan_id:
+                        report_limit = 50
+                    elif product_id == growth_plan_id:
+                        report_limit = 150
+                
+                # Check report limit for the current month
+                cur.execute(
+                    """
+                    SELECT COUNT(*) 
+                    FROM user_reports 
+                    WHERE user_id = %s
+                    AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+                    """,
+                    (user_id,)
+                )
+                report_count = cur.fetchone()[0]
+                
+                if report_count >= report_limit:
+                    return jsonify({
+                        'error': 'Report limit reached',
+                        'message': f'You have reached the maximum number of {report_limit} reports for this month.'
+                    }), 403
 
         except Exception as e:
             logging.error(f"Error verifying token: {str(e)}")
             return jsonify({'error': 'Authentication error'}), 401
 
-        if subscription_status == 'ACTIVE':
-            fast_search_response = fast_search_youtube(search_query)
+        # Everyone gets fast search
+        fast_search_response = fast_search_youtube(search_query)
+        
+        # Check if fast search was successful
+        if fast_search_response and 'error' not in fast_search_response:
+            # Get environment and base URL for source links
+            is_dev = os.getenv('APP_ENV') == 'development'
+            base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
             
-            # Check if fast search was successful
-            if fast_search_response and 'error' not in fast_search_response:
-                # Get environment and base URL for source links
-                is_dev = os.getenv('APP_ENV') == 'development'
-                base_url = 'http://localhost:8080' if is_dev else 'https://swiftnotes.ai'
+            # Save the report to database and S3
+            try:
+                # Extract title
+                title = fast_search_response.get('title', f"Research Report: {search_query[:50]}")
                 
-                # Save the report to database and S3
-                try:
-                    # Extract title
-                    title = fast_search_response.get('title', f"Research Report: {search_query[:50]}")
-                    
-                    # Save to database
-                    conn = get_db_connection()
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            INSERT INTO user_reports 
-                            (user_id, search_query, title, created_at)
-                            VALUES (%s, %s, %s, NOW())
-                            RETURNING id
-                            """,
-                            (user_id, search_query, title)
-                        )
-                        report_id = cur.fetchone()[0]
-                        conn.commit()
-
-                    # Save to S3
-                    s3_client = boto3.client(
-                        's3',
-                        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                # Save to database
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO user_reports 
+                        (user_id, search_query, title, created_at)
+                        VALUES (%s, %s, %s, NOW())
+                        RETURNING id
+                        """,
+                        (user_id, search_query, title)
                     )
-                    bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
-                    s3_key = f"reports/{report_id}"
-                    
-                    # Add sources section to markdown content
-                    markdown_content = fast_search_response['content']
-                    markdown_content += "\n\n## Sources\n"
-                    for source in fast_search_response['sources']:
-                        video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', source['url'])
-                        if video_id_match:
-                            video_id = video_id_match.group(1)
-                            note_url = f"{base_url}/?v={video_id}"
-                            markdown_content += f"{source['number']}. [{source['title']}]({note_url})\n"
-                        else:
-                            markdown_content += f"{source['number']}. [{source['title']}]({source['url']})\n"
-                    
-                    s3_client.put_object(
-                        Bucket=bucket_name,
-                        Key=s3_key,
-                        Body=markdown_content,
-                        ContentType='text/plain'
-                    )
+                    report_id = cur.fetchone()[0]
+                    conn.commit()
 
-                    return jsonify({
-                        'id': str(report_id),
-                        'content': markdown_content,
-                    }), 200
-                    
-                except Exception as e:
-                    logging.error(f"Error saving fast search report: {str(e)}")
-                    # Continue with regular search if fast search fails to save
-            else: 
-                return jsonify({'error': 'Failed to generate report'}), 500
+                # Save to S3
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+                )
+                bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+                s3_key = f"reports/{report_id}"
+                
+                # Add sources section to markdown content
+                markdown_content = fast_search_response['content']
+                markdown_content += "\n\n## Sources\n"
+                for source in fast_search_response['sources']:
+                    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', source['url'])
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        note_url = f"{base_url}/?v={video_id}"
+                        markdown_content += f"{source['number']}. [{source['title']}]({note_url})\n"
+                    else:
+                        markdown_content += f"{source['number']}. [{source['title']}]({source['url']})\n"
+                
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=s3_key,
+                    Body=markdown_content,
+                    ContentType='text/plain'
+                )
+
+                return jsonify({
+                    'id': str(report_id),
+                    'content': markdown_content,
+                }), 200
+                
+            except Exception as e:
+                logging.error(f"Error saving fast search report: {str(e)}")
+                # Continue with regular search if fast search fails to save
+        else: 
+            return jsonify({'error': 'Failed to generate report'}), 500
 
         # Replace with your actual API key
         API_KEY = os.getenv('GOOGLE_API_KEY')
