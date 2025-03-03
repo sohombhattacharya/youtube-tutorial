@@ -690,13 +690,15 @@ def process_video(video):
         logging.error(f"Error processing video {video_url}: {str(e)}")
         return None
 
-@search_bp.route('/deep_research', methods=['GET'])
+@search_bp.route('/deep_research', methods=['POST'])
 def deep_research():
     """
     Generate a comprehensive research report based on YouTube content.
     
-    Required parameters:
-    - search: The search query or research topic
+    Required JSON body:
+    {
+      "search": "your search query here"
+    }
     
     Authentication:
     - Requires a valid API key as Bearer token in the Authorization header
@@ -738,16 +740,17 @@ def deep_research():
         
         api_key = auth_header.split(' ')[1]
         
-        # Get search query
-        search_query = request.args.get('search', '').strip()
-        if not search_query:
-            return jsonify({'error': 'No search query provided'}), 400
+        # Get search query from JSON body
+        request_data = request.get_json()
+        if not request_data or 'search' not in request_data:
+            return jsonify({'error': 'No search query provided in request body'}), 400
             
+        search_query = request_data['search'].strip()
+        if not search_query:
+            return jsonify({'error': 'Search query cannot be empty'}), 400
+        
         # Store the request as a JSON string
-        request_data = json.dumps({
-            'search': search_query,
-            'headers': dict(request.headers),
-        })
+        request_json_str = json.dumps(request_data)
         
         # Validate API key against database
         conn = get_db_connection()
@@ -1023,7 +1026,7 @@ def deep_research():
                                 (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms, request)
                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                                 """,
-                                (api_call_id, api_key, '/deep_research', 200, credits_for_this_call, request.remote_addr, response_time_ms, request_data)
+                                (api_call_id, api_key, '/deep_research', 200, credits_for_this_call, request.remote_addr, response_time_ms, request_json_str)
                             )
                             conn.commit()
                     except Exception as e:
@@ -1044,7 +1047,7 @@ def deep_research():
                                 (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms, request)
                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                                 """,
-                                (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms, request_data)
+                                (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms, request_json_str)
                             )
                             conn.commit()
                     except Exception as e:
