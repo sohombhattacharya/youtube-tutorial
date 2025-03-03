@@ -31,9 +31,10 @@ def get_user():
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             # Try to find existing user
             cur.execute("""
-                SELECT id, email, auth0_id, subscription_status, subscription_cancelled_period_ends_at
-                FROM users 
-                WHERE auth0_id = %s
+                SELECT u.id, u.email, u.auth0_id, u.subscription_status, 
+                       u.subscription_cancelled_period_ends_at, u.product_id
+                FROM users u
+                WHERE u.auth0_id = %s
             """, (auth0_id,))
             
             user = cur.fetchone()
@@ -44,7 +45,8 @@ def get_user():
                     INSERT INTO users 
                     (email, auth0_id, subscription_status, created_at, updated_at)
                     VALUES (%s, %s, 'INACTIVE', NOW(), NOW())
-                    RETURNING id, email, auth0_id, subscription_status, subscription_cancelled_period_ends_at
+                    RETURNING id, email, auth0_id, subscription_status, 
+                             subscription_cancelled_period_ends_at, product_id
                 """, (email, auth0_id))
                 user = cur.fetchone()
                 conn.commit()
@@ -57,7 +59,23 @@ def get_user():
                 'auth0_id': user['auth0_id'],
                 'subscription_status': user['subscription_status'],
                 'subscription_ends_at': user['subscription_cancelled_period_ends_at'].isoformat() if user['subscription_cancelled_period_ends_at'] else None,
+                'subscription_product_id': user['product_id'],
             }
+            
+            # Map product ID to product name using environment variables
+            product_id = user['product_id']
+            if product_id:
+                if product_id == os.getenv('PRO_PLAN_PRODUCT_ID'):
+                    user_data['subscription_product'] = 'PRO'
+                elif product_id == os.getenv('ADVANCED_PLAN_PRODUCT_ID'):
+                    user_data['subscription_product'] = 'ADVANCED'
+                elif product_id == os.getenv('GROWTH_PLAN_PRODUCT_ID'):
+                    user_data['subscription_product'] = 'GROWTH'
+                else:
+                    user_data['subscription_product'] = 'UNKNOWN'
+            else:
+                user_data['subscription_product'] = "FREE"
+                
             return jsonify(user_data), 200
 
     except Exception as e:
