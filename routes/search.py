@@ -738,6 +738,17 @@ def deep_research():
         
         api_key = auth_header.split(' ')[1]
         
+        # Get search query
+        search_query = request.args.get('search', '').strip()
+        if not search_query:
+            return jsonify({'error': 'No search query provided'}), 400
+            
+        # Store the request as a JSON string
+        request_data = json.dumps({
+            'search': search_query,
+            'headers': dict(request.headers),
+        })
+        
         # Validate API key against database
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -793,10 +804,6 @@ def deep_research():
                     'error': 'Credit limit reached',
                     'message': f'This call would exceed your monthly limit of {credit_limit} credits. Please upgrade for higher volume needs.'
                 }), 403
-
-        search_query = request.args.get('search', '').strip()
-        if not search_query:
-            return jsonify({'error': 'No search query provided'}), 400
         
         timing_info = {}
         timing_info['query'] = search_query
@@ -1007,16 +1014,16 @@ def deep_research():
                         logging.error(f"Error storing API response in S3: {str(e)}")
                         # Continue even if S3 storage fails
                     
-                    # Log API call to database
+                    # Log API call to database with request data
                     try:
                         with conn.cursor() as cur:
                             cur.execute(
                                 """
                                 INSERT INTO api_calls 
-                                (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms, request)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                                 """,
-                                (api_call_id, api_key, '/deep_research', 200, credits_for_this_call, request.remote_addr, response_time_ms)
+                                (api_call_id, api_key, '/deep_research', 200, credits_for_this_call, request.remote_addr, response_time_ms, request_data)
                             )
                             conn.commit()
                     except Exception as e:
@@ -1028,16 +1035,16 @@ def deep_research():
                         'sources': sources
                     }), 200
                 else:
-                    # Log failed API call
+                    # Log failed API call with request data
                     try:
                         with conn.cursor() as cur:
                             cur.execute(
                                 """
                                 INSERT INTO api_calls 
-                                (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms, request)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                                 """,
-                                (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms)
+                                (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms, request_data)
                             )
                             conn.commit()
                     except Exception as e:
@@ -1049,6 +1056,16 @@ def deep_research():
         # Calculate response time even for errors
         response_time_ms = int((time.time() - start_time) * 1000)
         
+        # Create request data string for error case
+        try:
+            request_data = json.dumps({
+                'search': request.args.get('search', ''),
+                'headers': dict(request.headers),
+                'remote_addr': request.remote_addr
+            })
+        except:
+            request_data = json.dumps({'error': 'Could not serialize request'})
+        
         # Log error API call if we have the API key and connection
         if api_key and conn:
             try:
@@ -1056,10 +1073,10 @@ def deep_research():
                     cur.execute(
                         """
                         INSERT INTO api_calls 
-                        (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (id, api_key, endpoint_name, status_code, credits_used, request_ip, response_time_ms, request)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms)
+                        (api_call_id, api_key, '/deep_research', 500, 0, request.remote_addr, response_time_ms, request_data)
                     )
                     conn.commit()
             except Exception as log_error:

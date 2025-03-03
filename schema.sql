@@ -144,6 +144,7 @@ CREATE TABLE api_calls (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     api_key UUID NOT NULL,
     endpoint_name TEXT NOT NULL,
+    request TEXT NOT NULL,
     status_code INTEGER NOT NULL,
     credits_used INTEGER NOT NULL,
     request_ip TEXT,
