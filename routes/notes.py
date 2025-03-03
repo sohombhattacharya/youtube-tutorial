@@ -979,9 +979,9 @@ def get_monthly_usage():
 
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            # Get user's subscription status and ID
+            # Get user's subscription status, product ID, and user ID
             cur.execute("""
-                SELECT id, subscription_status 
+                SELECT id, subscription_status, product_id
                 FROM users 
                 WHERE auth0_id = %s
             """, (auth0_id,))
@@ -992,14 +992,31 @@ def get_monthly_usage():
             
             user_id = user['id']
             subscription_status = user['subscription_status']
+            product_id = user['product_id']
             
-            # Set limits based on subscription status
+            # Get product IDs from environment variables
+            pro_plan_id = os.getenv('PRO_PLAN_PRODUCT_ID')
+            advanced_plan_id = os.getenv('ADVANCED_PLAN_PRODUCT_ID')
+            growth_plan_id = os.getenv('GROWTH_PLAN_PRODUCT_ID')
+            
+            # Set limits based on subscription status and product ID
             if subscription_status == 'ACTIVE':
-                notes_limit = float('inf')  # Unlimited notes for active users
-                reports_limit = 10  # 10 reports per month for active users
+                notes_limit = float('inf')  # Unlimited notes for all active users
+                
+                # Set report limits based on product ID
+                if product_id == pro_plan_id:
+                    reports_limit = 10  # Pro users: 10 reports per month
+                elif product_id == advanced_plan_id:
+                    reports_limit = 50  # Advanced users: 50 reports per month
+                elif product_id == growth_plan_id:
+                    reports_limit = 150  # Growth users: 150 reports per month
+                else:
+                    # Default for active users with unknown product ID
+                    reports_limit = 10
             else:
+                # Free users
                 notes_limit = 2  # 2 notes per month for free users
-                reports_limit = 2  # 2 reports per month for free users
+                reports_limit = 3  # 3 reports per month for free users
             
             # Count notes generated this month
             cur.execute("""

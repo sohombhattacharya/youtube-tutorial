@@ -73,6 +73,10 @@ def stripe_webhook():
                 if event.type == 'customer.subscription.created':
                     subscription = event.data.object
                     email = stripe.Customer.retrieve(subscription.customer).email
+                    
+                    # Get the product ID from the subscription
+                    product_id = subscription.plan.product
+                    
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute("""
@@ -80,9 +84,10 @@ def stripe_webhook():
                             SET subscription_status = 'ACTIVE',
                                 subscription_id = %s,
                                 stripe_customer_id = %s,
+                                product_id = %s,
                                 updated_at = NOW()
                             WHERE email = %s
-                        """, (subscription.id, subscription.customer, email))
+                        """, (subscription.id, subscription.customer, product_id, email))
                         
                         # Update webhook log with processing status
                         cur.execute("""
@@ -93,7 +98,7 @@ def stripe_webhook():
                             WHERE id = %s
                         """, (webhook_log_id,))
                     conn.commit()
-                    logging.info(f"New subscription created for customer {subscription.customer}")
+                    logging.info(f"New subscription created for customer {subscription.customer} with product {product_id}")
                     
                 elif event.type == 'invoice.paid':
                     invoice = event.data.object
@@ -114,10 +119,21 @@ def stripe_webhook():
                 elif event.type == 'customer.subscription.updated':
                     subscription = event.data.object
                     
-                    if subscription.cancel_at_period_end == False:
-                        # Handle subscription renewal (existing code)
-                        conn = get_db_connection()
-                        with conn.cursor() as cur:
+                    # Get the product ID from the updated subscription
+                    product_id = subscription.plan.product
+                    
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        # First, update the product ID for all subscription updates
+                        cur.execute("""
+                            UPDATE users 
+                            SET product_id = %s,
+                                updated_at = NOW()
+                            WHERE stripe_customer_id = %s
+                        """, (product_id, subscription.customer))
+                        
+                        # Handle subscription renewal case
+                        if subscription.cancel_at_period_end == False:
                             cur.execute("""
                                 UPDATE users 
                                 SET subscription_status = 'ACTIVE',
@@ -137,11 +153,19 @@ def stripe_webhook():
                                     WHERE id = %s
                                 """, (webhook_log_id,))
                                 logging.info(f"Subscription renewed for customer {subscription.customer}")
-                    
-                    elif subscription.cancel_at_period_end == True:
-                        # Handle subscription cancellation
-                        conn = get_db_connection()
-                        with conn.cursor() as cur:
+                            else:
+                                # This might be a plan change
+                                cur.execute("""
+                                    UPDATE webhook_logs 
+                                    SET processing_status = 'success',
+                                        processing_details = 'Subscription plan updated to product ' || %s,
+                                        processed_at = NOW()
+                                    WHERE id = %s
+                                """, (product_id, webhook_log_id,))
+                                logging.info(f"Subscription plan updated for customer {subscription.customer} to product {product_id}")
+                        
+                        elif subscription.cancel_at_period_end == True:
+                            # Handle subscription cancellation
                             cur.execute("""
                                 UPDATE users 
                                 SET subscription_cancelled_at = NOW(),
@@ -158,8 +182,8 @@ def stripe_webhook():
                                 WHERE id = %s
                             """, (webhook_log_id,))
                             logging.info(f"Subscription cancelled (pending end of period) for customer {subscription.customer}")
-                    
-                    conn.commit()
+                        
+                        conn.commit()
 
                 elif event.type == 'invoice.payment_failed':
                     invoice = event.data.object
