@@ -231,6 +231,7 @@ def get_api_usage():
     
     Optional parameters:
     - month: Month to get usage for in YYYY-MM format (e.g., '2023-03'). Defaults to current month.
+    - timezone: Timezone offset in hours from UTC (e.g., '-5', '+8'). Defaults to '0' (UTC).
     
     Authentication:
     - Requires a valid Auth0 Bearer token in the Authorization header
@@ -241,6 +242,7 @@ def get_api_usage():
       {
         "api_key": "uuid-string",
         "month": "YYYY-MM",
+        "timezone_offset": "string",
         "daily_usage": [
           {
             "date": "YYYY-MM-DD",
@@ -274,6 +276,27 @@ def get_api_usage():
             return jsonify({
                 'error': 'Missing parameter',
                 'message': 'The api_key parameter is required'
+            }), 400
+            
+        # Get timezone parameter (default to UTC/0)
+        timezone_offset_str = request.args.get('timezone', '0')
+        try:
+            # Parse timezone offset (allow for '+5', '-5', '5', etc.)
+            timezone_offset_str = timezone_offset_str.replace(' ', '')
+            if timezone_offset_str and timezone_offset_str[0] not in ['+', '-']:
+                timezone_offset_str = '+' + timezone_offset_str
+                
+            timezone_offset = int(timezone_offset_str)
+            if timezone_offset < -12 or timezone_offset > 14:
+                raise ValueError("Timezone offset must be between -12 and +14")
+                
+            # Create a timezone object with the offset
+            from datetime import timedelta
+            tz_offset = timezone(timedelta(hours=timezone_offset))
+        except ValueError as e:
+            return jsonify({
+                'error': 'Invalid parameter',
+                'message': f'Invalid timezone offset: {timezone_offset_str}. Must be between -12 and +14.'
             }), 400
             
         # Get month parameter (default to current month)
@@ -343,47 +366,8 @@ def get_api_usage():
                 if not cur.fetchone():
                     return jsonify({'error': 'API key not found'}), 404
                 
-                # Get daily usage for the specified month
+                # Get all API calls for the specified month
                 query = """
-                SELECT 
-                    DATE(created_at) AS usage_date,
-                    SUM(credits_used) AS total_credits
-                FROM 
-                    api_calls
-                WHERE 
-                    api_key = %s
-                    AND created_at >= %s
-                    AND created_at < %s
-                GROUP BY 
-                    DATE(created_at)
-                ORDER BY 
-                    usage_date
-                """
-                
-                cur.execute(query, (api_key, start_date, end_date))
-                
-                # Create a dictionary to store usage by date
-                usage_by_date = {}
-                for row in cur.fetchall():
-                    usage_by_date[row[0].isoformat()] = float(row[1]) if row[1] else 0
-                
-                # Generate all days in the month
-                _, num_days = calendar.monthrange(month_date.year, month_date.month)
-                
-                # Create the daily usage array with all days of the month
-                daily_usage = []
-                for day in range(1, num_days + 1):
-                    date_str = f"{month_date.year}-{month_date.month:02d}-{day:02d}"
-                    # Create a UTC datetime object for midnight on this day
-                    day_datetime = datetime(month_date.year, month_date.month, day, 
-                                           tzinfo=timezone.utc)
-                    daily_usage.append({
-                        'date': day_datetime.isoformat(),
-                        'credits_used': usage_by_date.get(date_str, 0)
-                    })
-                
-                # Get individual API calls for the month
-                call_query = """
                 SELECT 
                     id,
                     endpoint_name,
@@ -398,22 +382,52 @@ def get_api_usage():
                     AND created_at >= %s
                     AND created_at < %s
                 ORDER BY 
-                    created_at DESC
-                LIMIT 100
+                    created_at
                 """
                 
-                cur.execute(call_query, (api_key, start_date, end_date))
+                cur.execute(query, (api_key, start_date, end_date))
                 
-                # Format the API calls
+                # Process API calls and convert timestamps to user's timezone
                 api_calls = []
+                usage_by_date = {}
+                
                 for row in cur.fetchall():
-                    api_calls.append({
-                        'id': row[0],
-                        'endpoint': row[1],
-                        'status_code': row[2],
-                        'latency_ms': row[3],
-                        'timestamp': row[4].isoformat(),
-                        'credits_used': float(row[5]) if row[5] else 0
+                    # Convert UTC timestamp to user's timezone
+                    utc_timestamp = row[4].replace(tzinfo=timezone.utc)
+                    local_timestamp = utc_timestamp.astimezone(tz_offset)
+                    local_date = local_timestamp.date().isoformat()
+                    
+                    # Add to API calls list (limited to 100 most recent)
+                    if len(api_calls) < 100:
+                        api_calls.append({
+                            'id': row[0],
+                            'endpoint': row[1],
+                            'status_code': row[2],
+                            'latency_ms': row[3],
+                            'timestamp': utc_timestamp.isoformat(),  # Keep timestamp in UTC
+                            'credits_used': float(row[5]) if row[5] else 0
+                        })
+                    
+                    # Aggregate usage by date in user's timezone
+                    credits = float(row[5]) if row[5] else 0
+                    if local_date in usage_by_date:
+                        usage_by_date[local_date] += credits
+                    else:
+                        usage_by_date[local_date] = credits
+                
+                # Sort API calls by timestamp (newest first)
+                api_calls.sort(key=lambda x: x['timestamp'], reverse=True)
+                
+                # Generate all days in the month
+                _, num_days = calendar.monthrange(month_date.year, month_date.month)
+                
+                # Create the daily usage array with all days of the month
+                daily_usage = []
+                for day in range(1, num_days + 1):
+                    date_str = f"{month_date.year}-{month_date.month:02d}-{day:02d}"
+                    daily_usage.append({
+                        'date': date_str,
+                        'credits_used': usage_by_date.get(date_str, 0)
                     })
                 
                 # Get subscription information
@@ -463,9 +477,13 @@ def get_api_usage():
                 
                 current_month_usage = cur.fetchone()[0] or 0
                 
+                # Format timezone offset for display
+                display_offset = f"+{timezone_offset}" if timezone_offset >= 0 else str(timezone_offset)
+                
                 return jsonify({
                     'api_key': api_key,
                     'month': month,
+                    'timezone_offset': display_offset,
                     'daily_usage': daily_usage,
                     'api_calls': api_calls,
                     'credit_limit': credit_limit,
