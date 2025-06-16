@@ -188,6 +188,7 @@ def generate_tutorial_endpoint():
 
             return tutorial, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except Exception as e:
+        logging.error(f"Error generating tutorial: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @notes_bp.route('/get_tutorial', methods=['POST'])
