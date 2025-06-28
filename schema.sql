@@ -119,6 +119,17 @@ CREATE TABLE public_shared_reports (
     )
 );
 
+CREATE TABLE public_shared_notes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_note_id UUID REFERENCES user_notes(id),
+    note_generation_history_id UUID REFERENCES note_generation_history(id),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT one_note_type CHECK (
+        (user_note_id IS NULL AND note_generation_history_id IS NOT NULL) OR
+        (user_note_id IS NOT NULL AND note_generation_history_id IS NULL)
+    )
+);
+
 CREATE TABLE note_generation_history (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id),
