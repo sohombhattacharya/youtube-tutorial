@@ -1061,3 +1061,242 @@ def get_monthly_usage():
     except Exception as e:
         logging.error(f"Error in get_monthly_usage: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
+
+@notes_bp.route('/create_public_note', methods=['POST'])
+def create_public_note():
+    try:
+        # Get token from Authorization header and decode it
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authentication required'}), 401
+            
+        token = auth_header.split(' ')[1]
+        decoded_token = jwt.decode(
+            token,
+            auth0_validator.public_key,
+            claims_options={
+                "aud": {"essential": True, "value": AUTH0_AUDIENCE},
+                "iss": {"essential": True, "value": f'https://{AUTH0_DOMAIN}/'}
+            }
+        )
+        auth0_id = decoded_token['sub']
+        
+        data = request.json
+        note_id = data.get('note_id')  # For saved notes
+        youtube_video_url = data.get('youtube_video_url')  # For generated notes
+        note_type = data.get('note_type', 'tutorial')  # 'tutorial' or 'tldr'
+        
+        if not note_id and not youtube_video_url:
+            return jsonify({'error': 'Either note_id or youtube_video_url is required'}), 400
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Get user_id
+            cur.execute("""
+                SELECT id FROM users WHERE auth0_id = %s
+            """, (auth0_id,))
+            user_result = cur.fetchone()
+            if not user_result:
+                return jsonify({'error': 'User not found'}), 404
+            user_id = user_result['id']
+
+            if note_id:
+                # Handle saved notes
+                cur.execute("""
+                    SELECT n.id 
+                    FROM user_notes n
+                    WHERE n.id = %s AND n.user_id = %s
+                """, (note_id, user_id))
+                
+                result = cur.fetchone()
+                if not result:
+                    return jsonify({'error': 'Note not found or not owned by user'}), 404
+                
+                # Check for existing public share
+                cur.execute("""
+                    SELECT id
+                    FROM public_shared_notes
+                    WHERE user_note_id = %s
+                """, (note_id,))
+                
+                existing_share = cur.fetchone()
+                if existing_share:
+                    return jsonify({
+                        'public_id': existing_share['id']
+                    }), 200
+
+                # Create new public share entry for saved note
+                try:
+                    cur.execute("""
+                        INSERT INTO public_shared_notes 
+                        (user_note_id, created_at)
+                        VALUES (%s, NOW())
+                        RETURNING id
+                    """, (note_id,))
+                    conn.commit()
+                    
+                    public_id = cur.fetchone()['id']
+                    return jsonify({
+                        'public_id': public_id
+                    }), 201
+
+                except Exception as e:
+                    conn.rollback()
+                    logging.error(f"Database error creating public share: {str(e)}")
+                    return jsonify({'error': 'Failed to create public share'}), 500
+
+            else:
+                # Handle generated but unsaved notes
+                # Extract video ID from URL
+                video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', youtube_video_url)
+                if not video_id_match:
+                    return jsonify({'error': 'Invalid YouTube URL'}), 400
+                video_id = video_id_match.group(1)
+
+                # Find the note generation history entry
+                cur.execute("""
+                    SELECT id
+                    FROM note_generation_history
+                    WHERE user_id = %s AND youtube_video_id = %s AND note_type = %s
+                """, (user_id, video_id, note_type))
+                
+                generation_result = cur.fetchone()
+                if not generation_result:
+                    return jsonify({'error': 'Note generation not found. Please generate the note first.'}), 404
+                
+                generation_id = generation_result['id']
+                
+                # Check for existing public share
+                cur.execute("""
+                    SELECT id
+                    FROM public_shared_notes
+                    WHERE note_generation_history_id = %s
+                """, (generation_id,))
+                
+                existing_share = cur.fetchone()
+                if existing_share:
+                    return jsonify({
+                        'public_id': existing_share['id']
+                    }), 200
+
+                # Create new public share entry for generated note
+                try:
+                    cur.execute("""
+                        INSERT INTO public_shared_notes 
+                        (note_generation_history_id, created_at)
+                        VALUES (%s, NOW())
+                        RETURNING id
+                    """, (generation_id,))
+                    conn.commit()
+                    
+                    public_id = cur.fetchone()['id']
+                    return jsonify({
+                        'public_id': public_id
+                    }), 201
+
+                except Exception as e:
+                    conn.rollback()
+                    logging.error(f"Database error creating public share: {str(e)}")
+                    return jsonify({'error': 'Failed to create public share'}), 500
+
+    except JoseError as e:
+        logging.error(f"Invalid JWT token: {str(e)}")
+        return jsonify({'error': 'Invalid authentication token'}), 401
+    except Exception as e:
+        logging.error(f"Error in create_public_note: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@notes_bp.route('/get_public_note/<string:public_id>', methods=['GET'])
+def get_public_note(public_id):
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # First check the public_shared_notes table
+            cur.execute("""
+                SELECT user_note_id, note_generation_history_id
+                FROM public_shared_notes 
+                WHERE id = %s
+            """, (public_id,))
+            
+            shared_note = cur.fetchone()
+            if not shared_note:
+                return jsonify({'error': 'Public note not found'}), 404
+
+            user_note_id = shared_note['user_note_id']
+            generation_id = shared_note['note_generation_history_id']
+            
+            if user_note_id:
+                # Handle saved notes
+                cur.execute("""
+                    SELECT id, title, youtube_video_url
+                    FROM user_notes 
+                    WHERE id = %s
+                """, (user_note_id,))
+                note = cur.fetchone()
+                if not note:
+                    return jsonify({'error': 'Note data not found'}), 404
+                    
+                title = note['title']
+                youtube_video_url = note['youtube_video_url']
+                
+            else:
+                # Handle generated notes
+                cur.execute("""
+                    SELECT youtube_video_id, youtube_video_url, note_type
+                    FROM note_generation_history 
+                    WHERE id = %s
+                """, (generation_id,))
+                generation = cur.fetchone()
+                if not generation:
+                    return jsonify({'error': 'Note generation data not found'}), 404
+                    
+                # Create a title from the note type and video
+                title = f"{generation['note_type'].title()} Note"
+                youtube_video_url = generation['youtube_video_url']
+                
+            # Extract video ID from URL
+            video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', youtube_video_url)
+            if not video_id_match:
+                return jsonify({'error': 'Invalid YouTube URL in note'}), 400
+            
+            video_id = video_id_match.group(1)
+
+            # Get note content from S3 (try both tutorial and tldr)
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+            )
+            bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+            
+            # Try to get tutorial content first
+            tutorial_content = None
+            tldr_content = None
+            
+            try:
+                s3_key = f"notes/{video_id}"
+                s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                tutorial_content = s3_response['Body'].read().decode('utf-8')
+            except s3_client.exceptions.NoSuchKey:
+                pass
+            
+            try:
+                s3_key = f"tldr/{video_id}"
+                s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                tldr_content = s3_response['Body'].read().decode('utf-8')
+            except s3_client.exceptions.NoSuchKey:
+                pass
+            
+            if not tutorial_content and not tldr_content:
+                return jsonify({'error': 'Note content not found'}), 404
+                
+            return jsonify({
+                'title': title,
+                'youtube_video_url': youtube_video_url,
+                'tutorial_content': tutorial_content,
+                'tldr_content': tldr_content,
+            }), 200
+
+    except Exception as e:
+        logging.error(f"Error in get_public_note: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
