@@ -23,6 +23,29 @@ from authlib.jose.errors import JoseError  # For JWT error handling
 
 notes_bp = Blueprint('notes', __name__)
 
+def clean_youtube_url(url):
+    """
+    Clean YouTube URL to remove extra parameters and keep only the base URL with video ID.
+    
+    Examples:
+    - https://www.youtube.com/watch?v=LZnfsmBUEuE&ab_channel=MyFinancialFriend
+      -> https://www.youtube.com/watch?v=LZnfsmBUEuE
+    - https://youtu.be/LZnfsmBUEuE?si=xyz
+      -> https://www.youtube.com/watch?v=LZnfsmBUEuE
+    """
+    if not url:
+        return url
+    
+    # Extract video ID from various YouTube URL formats
+    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', url)
+    if not video_id_match:
+        return url  # Return original URL if no valid video ID found
+    
+    video_id = video_id_match.group(1)
+    
+    # Return clean standard YouTube URL format
+    return f"https://www.youtube.com/watch?v={video_id}"
+
 # Import your note generation functions here
 # from services.note_service import generate_tutorial, generate_tldr, etc.
 
@@ -74,6 +97,10 @@ def generate_tutorial_endpoint():
     # Continue with the rest of the endpoint logic
     data = request.json
     video_url = data.get('url')
+    
+    # Clean the YouTube URL to remove extra parameters
+    video_url = clean_youtube_url(video_url)
+    
     logging.info(f"Received request at /generate_tutorial with video_url: {video_url}, user_id: {auth0_id}")
         
     # Extract video ID from the URL
@@ -201,6 +228,9 @@ def get_tutorial():
     data = request.json
     video_url = data.get('url')
     is_tldr = data.get('tldr', False)  # Flag to determine if we want TLDR
+    
+    # Clean the YouTube URL to remove extra parameters
+    video_url = clean_youtube_url(video_url)
     
     subscription_status = 'INACTIVE'  # Default status
     auth0_id = None
@@ -368,6 +398,10 @@ def generate_tldr_endpoint():
 
     data = request.json
     video_url = data.get('url')
+    
+    # Clean the YouTube URL to remove extra parameters
+    video_url = clean_youtube_url(video_url)
+    
     logging.info(f"Received request at /generate_tldr with video_url: {video_url}")
         
     # Extract video ID from the URL
@@ -643,6 +677,9 @@ def save_note():
         title = data.get('title')
         if not youtube_url:
             return jsonify({'error': 'YouTube URL is required'}), 400
+        
+        # Clean the YouTube URL to remove extra parameters
+        youtube_url = clean_youtube_url(youtube_url)
 
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -731,6 +768,9 @@ def is_saved():
         youtube_url = data.get('url')
         if not youtube_url:
             return jsonify({'error': 'YouTube URL is required'}), 400
+        
+        # Clean the YouTube URL to remove extra parameters
+        youtube_url = clean_youtube_url(youtube_url)
 
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -1085,6 +1125,10 @@ def create_public_note():
         note_id = data.get('note_id')  # For saved notes
         youtube_video_url = data.get('youtube_video_url')  # For generated notes
         note_type = data.get('note_type', 'tutorial')  # 'tutorial' or 'tldr'
+        
+        # Clean the YouTube URL if provided
+        if youtube_video_url:
+            youtube_video_url = clean_youtube_url(youtube_video_url)
         
         if not note_id and not youtube_video_url:
             return jsonify({'error': 'Either note_id or youtube_video_url is required'}), 400
