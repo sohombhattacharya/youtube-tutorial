@@ -1250,6 +1250,75 @@ def create_public_note():
         logging.error(f"Error in create_public_note: {type(e).__name__}: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
+@notes_bp.route('/getSampleNotes', methods=['GET'])
+def get_sample_notes():
+    """
+    Public endpoint that returns hardcoded sample notes for 3 YouTube videos.
+    No authentication required.
+    """
+    try:
+        # Hardcoded sample videos with their categories
+        sample_videos = [
+            {
+                'video_id': '-HzgcbRXUK8',
+                'category': 'Podcast', 
+                'youtube_video_url': 'https://www.youtube.com/watch?v=-HzgcbRXUK8'
+            },            
+            {
+                'video_id': 'gzALIXcY4pg',
+                'category': 'History Lesson',
+                'youtube_video_url': 'https://www.youtube.com/watch?v=gzALIXcY4pg'
+            },
+            {
+                'video_id': 'vcfBVl0UEdQ',
+                'category': 'Fitness Tutorial',
+                'youtube_video_url': 'https://www.youtube.com/watch?v=vcfBVl0UEdQ'
+            }
+        ]
+
+        # Create S3 client
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+        )
+        bucket_name = os.getenv("S3_NOTES_BUCKET_NAME")
+        
+        sample_notes = []
+        
+        for video in sample_videos:
+            video_id = video['video_id']
+            
+            # Get tutorial content only
+            tutorial_content = None
+            
+            try:
+                # Get tutorial content
+                s3_key = f"notes/{video_id}"
+                s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                tutorial_content = s3_response['Body'].read().decode('utf-8')
+            except s3_client.exceptions.NoSuchKey:
+                logging.warning(f"Tutorial content not found for video {video_id}")
+            
+            # Only include videos that have tutorial content
+            if tutorial_content:
+                sample_notes.append({
+                    'video_id': video_id,
+                    'category': video['category'],
+                    'youtube_video_url': video['youtube_video_url'],
+                    'tutorial_content': tutorial_content
+                })
+            else:
+                logging.error(f"No tutorial content found for sample video {video_id}")
+        
+        return jsonify({
+            'sample_notes': sample_notes
+        }), 200
+
+    except Exception as e:
+        logging.error(f"Error in get_sample_notes: {type(e).__name__}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
 @notes_bp.route('/get_public_note/<string:public_id>', methods=['GET'])
 def get_public_note(public_id):
     try:

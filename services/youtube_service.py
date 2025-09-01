@@ -59,7 +59,7 @@ def generate_tldr(transcript_data, youtube_url):
         "Transcript:"
     )
 
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
     response = model.generate_content(prompt)
     
     # Log the title of the TLDR only if there is a response
@@ -132,7 +132,7 @@ def generate_tutorial(transcript_data, youtube_url):
         "Transcript:"
     )
     
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
     response = model.generate_content(prompt)
     
     # Log the title of the tutorial only if there is a response

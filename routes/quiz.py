@@ -65,7 +65,9 @@ def generate_quiz():
     prompt = (
         "Create a 10-question quiz based on the following markdown content. "
         "The questions should progressively increase in difficulty from easy to hard. "
-        "Return the quiz in a valid JSON object with the following example structure for 5 questions. The JSON object should NOT be wrapped in code blocks ``` ```. \n"
+        "IMPORTANT: Return ONLY a valid JSON object. Do NOT wrap the response in markdown code blocks, backticks, or any other formatting. "
+        "Do NOT include ```json or ``` in your response. Start directly with { and end with }. "
+        "Use the following example structure for 5 questions:\n"
         "{\n"
         '  "quiz": {\n'
         '    "title": "Understanding NFL Sunday Ticket",\n'
@@ -112,7 +114,7 @@ def generate_quiz():
         f"Markdown Content:\n{markdown_content}"
     )
     
-    model = genai.GenerativeModel("gemini-2.0-flash-lite")
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
     response = model.generate_content(prompt)
     
     if response and response.text:
