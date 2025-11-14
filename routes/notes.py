@@ -1270,9 +1270,9 @@ def get_sample_notes():
                 'youtube_video_url': 'https://www.youtube.com/watch?v=gzALIXcY4pg'
             },
             {
-                'video_id': 'vcfBVl0UEdQ',
-                'category': 'Fitness Tutorial',
-                'youtube_video_url': 'https://www.youtube.com/watch?v=vcfBVl0UEdQ'
+                'video_id': 'PYgJkTL5MRg',
+                'category': 'Science Interview',
+                'youtube_video_url': 'https://www.youtube.com/watch?v=PYgJkTL5MRg'
             }
         ]
 
