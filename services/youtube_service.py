@@ -4,16 +4,21 @@ import logging
 import requests
 import google.generativeai as genai
 import re
+from config import Config
 
 def transcribe_youtube_video(video_id, youtube_url, rotate_proxy=False):
     # Determine if running locally using the environment variable
     is_local = os.getenv('APP_ENV') == 'development'
 
     # Set proxies only if not running locally
-    proxies = None if is_local else {
-        'http': "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.decodo.com:7000" if rotate_proxy else "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.decodo.com:10001",
-        'https': "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.decodo.com:7000" if rotate_proxy else "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.decodo.com:10001"
-    }
+    proxies = None
+    if not is_local:
+        proxy_port = Config.PROXY_ROTATE_PORT if rotate_proxy else Config.PROXY_PORT
+        proxy_url = f"{Config.PROXY_USERNAME}:{Config.PROXY_PASSWORD}@{Config.PROXY_HOST}:{proxy_port}"
+        proxies = {
+            'http': f"http://{proxy_url}",
+            'https': f"https://{proxy_url}"
+        }
     
     # Fetch the transcript for the given video ID
     transcript_data = YouTubeTranscriptApi.get_transcript(video_id, proxies=proxies, languages=["en", "es", "fr", "de", "it", "pt", "ru", "zh", "hi", "uk", "cs", "sv"])
