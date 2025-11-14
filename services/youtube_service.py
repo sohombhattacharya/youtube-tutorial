@@ -11,8 +11,8 @@ def transcribe_youtube_video(video_id, youtube_url, rotate_proxy=False):
 
     # Set proxies only if not running locally
     proxies = None if is_local else {
-        'http': "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:7000" if rotate_proxy else "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001",
-        'https': "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:7000" if rotate_proxy else "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.smartproxy.com:10001"
+        'http': "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.decodo.com:7000" if rotate_proxy else "http://spclyk9gey:2Oujegb7i53~YORtoe@gate.decodo.com:10001",
+        'https': "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.decodo.com:7000" if rotate_proxy else "https://spclyk9gey:2Oujegb7i53~YORtoe@gate.decodo.com:10001"
     }
     
     # Fetch the transcript for the given video ID
