@@ -52,7 +52,7 @@ def clean_youtube_url(url):
 @notes_bp.route('/generate_tutorial', methods=['POST'])
 def generate_tutorial_endpoint():
     # Check for Bearer token
-    logging.debug(f"Request headers: {request.headers}")
+    logging.info(f"Request headers: {request.headers}")
     auth_header = request.headers.get('Authorization')
     logging.debug(f"Authorization header: {auth_header}")
 
